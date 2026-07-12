@@ -6,6 +6,7 @@ version = 4
 name = "tartine-core"
 version = "0.1.0"
 dependencies = [
+ "tartine-kcore",
  "tartine-proto",
 ]
 
@@ -14,9 +15,14 @@ name = "tartine-fuse"
 version = "0.1.0"
 dependencies = [
  "tartine-core",
+ "tartine-kcore",
  "tartine-meta",
  "tartine-proto",
 ]
+
+[[package]]
+name = "tartine-kcore"
+version = "0.1.0"
 
 [[package]]
 name = "tartine-meta"

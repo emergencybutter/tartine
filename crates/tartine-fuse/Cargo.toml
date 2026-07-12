@@ -8,5 +8,6 @@ license.workspace = true
 tartine-proto = { path = "../tartine-proto" }
 tartine-core = { path = "../tartine-core" }
 tartine-meta = { path = "../tartine-meta" }
+tartine-kcore = { path = "../tartine-kcore" }
 
 # fuser = "0.14"   # would replace the local `FilesystemOps` stand-in below

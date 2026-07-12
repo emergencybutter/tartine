@@ -8,6 +8,19 @@ to fully random-access writable files.
 
 Status: design draft. Target: single Linux host, local block devices.
 
+**Production target is an in-kernel filesystem** (`kernel/`, C, registered
+as a real `file_system_type` — `mount -t tartine`), not FUSE. FUSE
+(`crates/tartine-fuse`, `crates/tartined`) is a deliberate prototyping
+step: the design is validated end-to-end in userspace, where mistakes are
+cheap, before it's committed to kernel code, where they aren't. The two
+front ends share one implementation of the parts worth getting bit-for-bit
+identical — placement and the append-only/writable state machine — via
+`crates/tartine-kcore`, a dependency-free `#![no_std]` Rust crate compiled
+both as a plain Rust dependency (FUSE prototype) and as a `staticlib`
+linked into the C kernel module (production). See §3 and §4 for the full
+shape of this, and `kernel/README.md` for exactly what in the kernel
+module is real versus stubbed today.
+
 ## 1. Goals / non-goals
 
 **Goals**
@@ -25,12 +38,13 @@ Status: design draft. Target: single Linux host, local block devices.
   conversion is allowed to be expensive — it is not on any hot path.
 - Self-healing: disk loss is detected, under-replicated data and metadata
   are automatically repaired from surviving copies.
-- Runs entirely in userspace on stock Linux, using modern async I/O.
+- Runs as a native Linux kernel filesystem (`mount -t tartine`), with no
+  userspace daemon required to operate — see §3.
 
 **Non-goals (v1)**
 
 - Multi-host / networked cluster operation. Every disk is locally attached
-  to the one host running the daemon. (§13 sketches the extension.)
+  to the one host. (§13 sketches the extension.)
 - POSIX byte-range mandatory locking, full extended-ACL semantics — basic
   POSIX permissions/xattrs only.
 - Snapshots/clones (natural future extension given the log-structured
@@ -41,78 +55,122 @@ Status: design draft. Target: single Linux host, local block devices.
 The requirements talk about "disks", not "nodes" or "servers", and metadata
 lives on a *fixed count of 2 disks*, not a quorum-sized cluster. That maps
 directly onto a well-understood, much simpler problem than a distributed
-filesystem: **one daemon process is the single writer and arbiter for the
-whole pool**, and disks are dumb, locally-attached storage targets it reads
-and writes directly (like `mdadm`, ZFS, or Btrfs multi-device, but with
-per-file replication instead of whole-pool RAID levels).
+filesystem: **the mounted kernel module is the single writer and arbiter
+for the whole pool**, and disks are dumb, locally-attached storage targets
+it reads and writes directly (like `mdadm`, ZFS, or Btrfs multi-device, but
+with per-file replication instead of whole-pool RAID levels).
 
 This matters a lot for the metadata design: because there is exactly one
 writer, we do **not** need distributed consensus (Raft/Paxos) to keep two
 metadata replicas consistent. A synchronous primary→backup WAL ship with a
 fencing epoch is sufficient and is what real single-node mirrored designs
 (ZFS's mirrored ZIL, mdadm RAID-1) already do. §13 discusses what changes if
-this daemon is later made highly-available across two hosts.
+this were later made highly-available across two hosts.
 
 ## 3. High-level architecture
 
-```
-                         ┌───────────────────────────┐
-   user process          │        tartined            │
-   (open/read/write) ──▶ │  ┌───────────────────────┐ │
-        via VFS          │  │   FUSE session (fuser) │ │
-                         │  └──────────┬────────────┘ │
-                         │             ▼               │
-                         │   ┌───────────────────┐     │
-                         │   │   namespace / VFS  │     │
-                         │   │   op dispatcher     │     │
-                         │   └─────────┬─────────┘     │
-                         │             ▼                │
-                         │  ┌────────────────────────┐  │
-                         │  │  metadata engine        │  │
-                         │  │  (inode table, dirtree,  │  │
-                         │  │   chunk maps, WAL)       │  │
-                         │  └───────────┬──────────────┘ │
-                         │              ▼                 │
-                         │  ┌─────────────────────────┐   │
-                         │  │  pool manager             │   │
-                         │  │  (placement, membership,  │   │
-                         │  │   rebalancer, scrubber)    │  │
-                         │  └────────────┬──────────────┘  │
-                         │               ▼                  │
-                         │   ┌──────────────────────────┐   │
-                         │   │  disk I/O layer (io_uring) │  │
-                         │   └────┬────┬────┬────┬───────┘   │
-                         └────────┼────┼────┼────┼───────────┘
-                                  ▼    ▼    ▼    ▼
-                               disk1 disk2 disk3 disk4 ...   (pool)
+TartineFS is **Btrfs-shaped, not Ceph-shaped**: one kernel module owns
+everything — pool map, metadata, and the data path — the same way
+ext4/btrfs/xfs do. There is no daemon the filesystem depends on to mount
+or operate; `tartinectl` is a thin CLI that issues `ioctl(2)`s, exactly
+like `btrfs-progs` talks to btrfs. This was a deliberate choice over a
+"thin kernel client + always-on userspace control-plane daemon" split
+(the alternative considered — see the note at the end of this section):
+depending on a userspace process for anything beyond serving
+already-cached data is a materially different reliability story than
+every other production Linux filesystem, and this design doesn't need
+that trade for anything it's trying to accomplish.
 
-  control plane: tartinectl  ──unix socket (JSON/gRPC)──▶  tartined
+```
+                    ┌───────────────────────────────────────────────┐
+  user process      │               kernel: tartine.ko                │
+  (open/read/  ───▶ │  ┌─────────────────────────────────────────┐  │
+   write, ioctl)     via VFS: superblock / inode / file_operations   │
+                    │  └────────────────────┬────────────────────┘  │
+                    │                        ▼                       │
+                    │   ┌─────────────────────────────────────────┐ │
+                    │   │  write-path state machine + placement     │ │
+                    │   │  (tartine-kcore, linked in as a static    │ │
+                    │   │   lib — §4)                                 │ │
+                    │   └────────────────────┬────────────────────┘ │
+                    │                        ▼                       │
+                    │   ┌─────────────────────────────────────────┐ │
+                    │   │  metadata (in-kernel on-disk B-tree,       │ │
+                    │   │  2-disk synchronous WAL — §6)               │ │
+                    │   └────────────────────┬────────────────────┘ │
+                    │                        ▼                       │
+                    │   ┌─────────────────────────────────────────┐ │
+                    │   │  block I/O (bio / blk-mq)                  │ │
+                    │   └───┬────────┬────────┬────────┬──────────┘ │
+                    │       ▼        ▼        ▼        ▼             │
+                    └───────┼────────┼────────┼────────┼─────────────┘
+                           disk1    disk2    disk3    disk4 ...   (pool)
+
+  admin: tartinectl  ──ioctl(2) on the mountpoint, or on /dev/tartine-ctl
+                         pre-mount for device scan ──▶  tartine.ko
 ```
 
-`tartined` is the only process that opens the raw block devices. It exposes
-the namespace to the kernel via FUSE (`/dev/fuse`), and exposes pool/file
-administration via a local control socket used by the `tartinectl` CLI (and
-by the `ioctl`/xattr handlers, which are just sugar over the same control
-API executed inline on the FUSE session).
+`tartine.ko` is the only thing that opens the raw block devices. Pool-wide
+administration (disk add/remove, per-file replication factor, the
+append→writable conversion trigger) is all `ioctl(2)` on the mounted
+filesystem, handled synchronously or by a kernel workqueue for anything
+that runs in the background (rebalancing, scrubbing, materialization).
+Before a pool's first disk is mounted, a small control device
+(`/dev/tartine-ctl`) accepts a "scan this device" ioctl so the module can
+learn which block devices belong to which pool — the same role
+`btrfs device scan` plays for btrfs multi-device pools, needed because a
+pool spans multiple device nodes and a plain `mount /dev/sda1 /mnt` only
+names one of them (see `kernel/tartine.h`'s `TARTINE_CTL_IOC_SCAN_DEVICE`).
+
+**Why not a thin kernel client + userspace control daemon instead** (the
+alternative seriously considered before committing to the all-in-kernel
+design above): it would mean far less new kernel code — the module would
+only need to handle the VFS/data-I/O hot path using placement/metadata
+state pushed down from userspace, while a daemon like the FUSE
+prototype's `tartined` kept owning pool topology changes, metadata WAL
+replication, and rebalancing. That's a real reduction in kernel-code
+risk. It was set aside because it reintroduces exactly the dependency
+this design is trying to avoid: the filesystem would work for
+already-cached reads even with the daemon down, but anything involving
+pool topology or metadata durability would not — a materially different
+promise than "you can always `mount -t tartine` and get a working
+filesystem," which is what every other production Linux filesystem
+guarantees and what this design commits to as well.
+
 
 ## 4. Technology choices
 
+### 4.1 Production (`kernel/`): C + a `no_std` Rust core
+
 | Concern | Choice | Why |
 |---|---|---|
-| Filesystem frontend | [`fuser`](https://github.com/cberner/fuser) (Rust FUSE bindings), or `fuse3` for async | Memory-safe, fast to iterate, runs as a normal process. Linux 6.9+ `FUSE_PASSTHROUGH` and the `io_uring`-backed FUSE queue close most of the historical FUSE performance gap for large sequential I/O, which is the dominant pattern here (append + eventual materialization). |
-| Disk I/O | `io_uring` (via the `io-uring` crate directly, or `tokio-uring`) with `O_DIRECT` | Zero-copy, batched, async submission to many disks concurrently; avoids double-buffering through the page cache for large append/replication writes. |
-| Embedded metadata store | [`redb`](https://github.com/cberner/redb) (pure-Rust, MVCC, ACID, file-backed B-tree) | No unsafe, no C dependency, transactional — a good fit to be the on-disk engine underneath the metadata WAL/replica. `sled` is a fallback if redb's write-amplification profile is unacceptable. |
-| Serialization | `serde` + `bincode` for on-disk records, `prost` (protobuf) for the control-plane RPC | Stable, fast, well understood. |
-| Checksums | `blake3` (data blocks, cheap enough to run inline, strong integrity), `crc32c` (per-I/O quick check on the hot path, hardware accelerated) | Matches modern CoW filesystems (ZFS, Btrfs) practice of checksum-everything + scrub. |
-| Placement | Rendezvous hashing (HRW), hand-rolled | O(1) to compute, minimal data movement on pool membership change, no need to gossip a full CRUSH-like map — see §7. |
-| Async runtime | `tokio` | Ubiquitous, integrates with `io-uring` crates and gRPC (`tonic`) for the control plane. |
-| Control-plane RPC | `tonic` (gRPC) over a Unix domain socket | Typed, streamable (useful for progress-reporting long operations like conversion or drain), local-only. |
+| VFS glue (superblock/inode/`file_operations`), kbuild integration | C | Full, mature access to the VFS API and block layer with no abstraction gap to fight. Rust-for-Linux's bindings for *drivers* are solid, but its bindings for building a full custom *local filesystem* (as opposed to a device driver) are still nascent as of this writing — betting the VFS glue itself on them would mean building or upstreaming missing abstractions as part of this project, on top of designing the filesystem. Not worth the combined risk for a first kernel version. |
+| Placement (HRW) and the append-only/converting/writable state machine | `crates/tartine-kcore`, `#![no_std]`, zero dependencies, compiled as a `staticlib` and linked into the `.ko` | This is the logic worth isolating in a memory-safe, unit-tested language: pure functions, no allocation, no floating point (see §4.2), small enough to fully specify and test outside the kernel. It's also the *one* implementation both the kernel module and the FUSE prototype run — see §4.2. |
+| On-disk metadata store | Purpose-built on-disk B-tree against the block layer directly (C) — **not** an embedded userspace KV engine | Nothing like `redb`/`sled` (they assume `std`, `mmap` of regular files) is usable from kernel context. This is the same problem Btrfs/XFS solved for themselves; there's no shortcut, the metadata engine has to be written against `struct bio`/the block layer like the rest of a kernel filesystem. Not implemented yet — see `kernel/README.md`'s scope notes and §15's roadmap. |
+| Disk I/O | `struct bio` submission via `blk-mq` | The kernel's own modern (multi-queue) async block I/O path — the in-kernel equivalent of what `io_uring` gives a userspace program, and the only option once the module is genuinely in-kernel (`io_uring` is a *userspace-facing* syscall interface; it has no meaning from inside a kernel module). |
+| Checksums | Kernel's built-in `crc32c()` (`lib/crc32c.c`, hardware-accelerated where available) | Already provided, already fast, no reason to duplicate it in `tartine-kcore` — see that crate's doc comment for why checksumming was deliberately left out of the Rust core. |
+| Placement key hashing | FNV-1a, hand-rolled in `tartine-kcore` | `core` has no `SipHash` (that's `std`-only); FNV-1a needs no crate and no cryptographic strength, just good distribution — see `tartine-kcore/src/hash.rs`. |
+| Admin surface | `ioctl(2)` on the mountpoint (already-mounted pool) and on `/dev/tartine-ctl` (pre-mount device scan) | Same shape as `btrfs-progs`; no RPC framework, no daemon, no socket to manage. |
 
-Rust is a good fit for the whole system: this is exactly the class of
-software (unsafe raw I/O, concurrent state machines, on-disk format
-correctness) where Rust's guarantees pay for themselves, and the modern
-crate ecosystem (`redb`, `io-uring`, `fuser`, `blake3`) already covers every
-major component without needing a C dependency.
+### 4.2 Prototype (`crates/tartine-fuse`, `crates/tartined`): Rust, FUSE
+
+| Concern | Choice | Why |
+|---|---|---|
+| Filesystem frontend | [`fuser`](https://github.com/cberner/fuser) (Rust FUSE bindings) | Runs as a normal process, so the design — placement, replication, the append-only/writable state machine, failure handling — can be built and iterated on quickly and safely before any of it becomes kernel code, where mistakes are much more expensive. This is a means to validate the design, not an alternative production target (§3). |
+| Disk I/O | `io_uring` / `tokio-uring`, `O_DIRECT` | The userspace equivalent of `blk-mq` above; fits a `std`-linked async prototype well. |
+| Embedded metadata store | [`redb`](https://github.com/cberner/redb) | Lets the prototype validate the *metadata replication protocol* (§6) quickly without also hand-writing an on-disk B-tree in the prototype — that part of the kernel module's design (§4.1) is deliberately not re-derived here, since `redb` itself isn't what ships. |
+| Shared logic | `tartine-kcore` (§4.1), consumed as a plain Rust dependency (its `freestanding` feature, and thus its `no_std`-ness, is off in this configuration) | The prototype calls the exact same compiled placement and write-path functions the kernel module will call through its C ABI — not a lookalike reimplementation that could quietly drift from what ships. `tartine-core`'s `targets()` (a `Vec`/`PoolMap`-friendly convenience wrapper) and `tartine-fuse`'s write-path adapter are both thin translation layers over `tartine-kcore`, not separate algorithms. |
+
+Rust is a good fit for the whole system's *logic* — this is exactly the
+class of code (concurrent state machines, on-disk format correctness)
+where its guarantees pay for themselves — but "prefer Rust" runs into a
+real limit at the VFS boundary itself: that layer needs the kernel's C
+API surface either way, and Rust-for-Linux's coverage of it for full
+custom filesystems isn't there yet. Splitting the system exactly at that
+boundary (§4.1 vs. the parts of §4.1 carved into `tartine-kcore`) is what
+lets this design get real Rust safety guarantees on the parts that
+benefit most, without staking the whole kernel module on unproven
+bindings.
 
 ## 5. On-disk layout
 
@@ -122,15 +180,22 @@ A disk joining the pool is formatted with a small superblock and then used
 in one (or both) of two roles, tracked in the pool map:
 
 - **data role**: stores chunk-log segments for file data.
-- **metadata role**: stores a full replica of the metadata store (`redb`
-  file) for a metadata group it belongs to. In v1 there is exactly one
-  metadata group, backed by exactly 2 disks.
+- **metadata role**: stores a full replica of the metadata store — the
+  in-kernel on-disk B-tree described in §4.1 (the FUSE prototype
+  substitutes `redb` here for speed of iteration; see §4.2) — for a
+  metadata group it belongs to. In v1 there is exactly one metadata
+  group, backed by exactly 2 disks.
 
 A disk can hold both roles simultaneously (common case for small pools); at
 larger scale operators will typically dedicate a couple of fast disks
 (NVMe) to the metadata role.
 
 ### 5.2 Superblock (first 4 KiB of the device)
+
+This is what `kernel/tartine.h`'s `struct tartine_disk_super` and
+`kernel/tartine_main.c`'s `tartine_fill_super()` actually implement
+(`__packed`, explicit little-endian field widths — it crosses the disk
+boundary, so no compiler is allowed to reinterpret it):
 
 ```rust
 struct SuperBlock {
@@ -140,11 +205,13 @@ struct SuperBlock {
     roles: DiskRoles,        // bitflags: DATA, METADATA
     format_version: u32,
     created_at: u64,
-    // epoch of the pool map this disk last observed; used on daemon
-    // startup to detect a disk that missed membership changes while
-    // offline (e.g. was unplugged) and needs catch-up/resync.
+    // epoch of the pool map this disk last observed; used on mount to
+    // detect a disk that missed membership changes while offline (e.g.
+    // was unplugged) and needs catch-up/resync.
     last_seen_epoch: u64,
-    checksum: u32,           // crc32c of the rest of the block
+    checksum: u32,           // crc32c() of the rest of the block — the
+                              // kernel's own, already hardware-accelerated
+                              // where available; see §4.1.
 }
 ```
 
@@ -161,28 +228,39 @@ Record {
     inode: u64,
     chunk_seq: u64,       // monotonic per-inode chunk sequence number
     len: u32,
-    checksum: u64,        // blake3 (truncated) of payload
+    checksum: u32,        // crc32c() of payload (§4.1)
     payload: [u8; len],
 }
 ```
 
 This is a Bitcask/Kafka-style append log: writes are pure sequential
-`io_uring` writes (great for HDD and SSD alike, and trivially batchable).
-Segments are immutable once sealed (full or the file was closed); a
-background **compactor** reclaims space from segments whose records have
-been superseded (file deleted, truncated, or *materialized* by the
-append→writable conversion, §9.3) by copying live records forward into a
-fresh segment and freeing the old one.
+`bio` submissions via `blk-mq` in the kernel module (great for HDD and SSD
+alike, and trivially batchable; the FUSE prototype's equivalent is
+`io_uring`, §4.2). Segments are immutable once sealed (full or the file
+was closed); a background **compactor** reclaims space from segments
+whose records have been superseded (file deleted, truncated, or
+*materialized* by the append→writable conversion, §9.3) by copying live
+records forward into a fresh segment and freeing the old one.
 
 Once a file is converted to writable, its data moves out of the chunk-log
-into **fixed-size block extents** (default 128 KiB, `O_DIRECT`-aligned) laid
+into **fixed-size block extents** (default 128 KiB, block-aligned) laid
 out in a conventional extent allocator (a per-disk free-space bitmap/B-tree)
 so that random `pwrite`/`mmap` writes are simple in-place block writes, same
 as any conventional filesystem.
 
+`crates/tartine-core/src/segment.rs` implements this same record layout
+for the FUSE prototype (as plain synchronous file I/O rather than `bio`).
+It's independently written, not shared code the way placement/write-path
+are (§4.2) — the two implementations agreeing on the on-disk format is a
+spec-conformance property, not a code-sharing one. §15's roadmap flags
+golden test vectors as the way to actually verify that agreement instead
+of assuming it.
+
 ### 5.4 Metadata role: replicated store
 
-Each metadata-role disk holds a `redb` database file containing:
+Each metadata-role disk holds a metadata store (the in-kernel on-disk
+B-tree in production, a `redb` database file in the FUSE prototype — §4)
+containing:
 
 - **inode table**: `inode_id -> InodeRecord` (mode flags including
   `AppendOnly | Converting | Writable`, size, replication_factor, owner,
@@ -198,17 +276,18 @@ Each metadata-role disk holds a `redb` database file containing:
 Given the single-writer model (§2), metadata replication is **synchronous
 primary/backup log shipping with a fencing epoch**, not consensus:
 
-1. The daemon holds an in-memory `MetaGroup { primary: DiskId, backup: DiskId, epoch: u64 }`.
+1. The mounted module holds an in-memory `MetaGroup { primary: DiskId, backup: DiskId, epoch: u64 }`.
 2. Every metadata mutation (create, unlink, rename, chunk-map update,
    pool-map change, replication-factor change, ...) is first serialized as a
    `MetaOp` and appended to a WAL record.
-3. The WAL record is written with `io_uring` to **both** disks concurrently
-   and the operation is not acknowledged to the caller (i.e. the FUSE call
-   does not return) until both writes are durable (`fdatasync`), or until
-   the backup is declared dead by the health monitor and the group
-   fails over to primary-only mode (degraded; see below).
+3. The WAL record is written (via `bio` submission in production, `io_uring`
+   in the FUSE prototype — §4) to **both** disks concurrently, and the
+   operation is not acknowledged to the caller (the VFS call does not
+   return) until both writes are durable, or until the backup is declared
+   dead by the health monitor and the group fails over to primary-only
+   mode (degraded; see below).
 4. Periodically (or on WAL size threshold) the WAL is checkpointed into the
-   `redb` B-tree on both disks and truncated.
+   metadata B-tree on both disks and truncated.
 
 This gives the same durability guarantee as synchronous RAID-1 for
 metadata: either disk alone has everything needed to reconstruct current
@@ -229,15 +308,15 @@ or automatic on failure):
   replacement backup from the pool (best free space / lowest utilization)
   and streams a full resync. This mirrors how ZFS handles a mirrored ZIL
   vdev losing a member.
-- On daemon restart, it reads the superblock `last_seen_epoch` +
-  a small fixed well-known location pointer on *every* disk in the pool
-  (not just metadata disks) that records "who is the current metadata
-  group" — this bootstrap pointer itself is written with the same
-  synchronous 2-disk rule, so it's always discoverable even if the disk you
-  probe first is neither current metadata replica. Practically: each disk's
-  superblock carries a cached copy of the last known `MetaGroup`; the
-  daemon unions what it finds across all present disks and picks the
-  highest-epoch, majority-agreeing answer to open.
+- On mount, the module reads the superblock `last_seen_epoch` + a small
+  fixed well-known location pointer on *every* disk in the pool (not just
+  metadata disks) that records "who is the current metadata group" — this
+  bootstrap pointer itself is written with the same synchronous 2-disk
+  rule, so it's always discoverable even if the disk you probe first is
+  neither current metadata replica. Practically: each disk's superblock
+  carries a cached copy of the last known `MetaGroup`; mount unions what
+  it finds across all present disks (via the device-scan registry, §3)
+  and picks the highest-epoch, majority-agreeing answer to open.
 
 **Scaling beyond one metadata group** (future, not required by the spec but
 worth noting): shard the namespace by directory hash into N independent
@@ -265,7 +344,7 @@ struct DiskEntry {
 ```
 
 The pool map is itself just another row in the metadata store, replicated
-like everything else (§6), so it survives daemon restarts and is
+like everything else (§6), so it survives unmount/remount and is
 immediately consistent for all placement decisions.
 
 ### 7.2 Placement: rendezvous hashing (HRW), not CRUSH
@@ -348,10 +427,12 @@ Every newly created file starts with `InodeRecord.mode = AppendOnly`. In
 this state:
 
 - `write()` is only accepted at the current end-of-file offset — enforced
-  by the daemon regardless of the flags the client opened with (i.e. even
-  without `O_APPEND`, non-append writes are rejected), matching the
+  by the filesystem regardless of the flags the client opened with (i.e.
+  even without `O_APPEND`, non-append writes are rejected), matching the
   "append-only at birth" requirement rather than relying on the calling
-  process to behave.
+  process to behave. This is `tartine_kcore::write_path::classify_write`
+  (§4.1/§4.2) — the same function decides this for both the kernel module
+  and the FUSE prototype.
 - `ftruncate`, `pwrite` to non-EOF offsets, and writable `mmap` all fail
   with `EPERM`.
 - Each accepted append becomes one `Record` (§5.3) in the chunk-log,
@@ -366,11 +447,13 @@ this state:
 
 ### 9.2 Triggering the conversion
 
-Three equivalent entry points, all routed to the same daemon-side
-operation:
+Three equivalent entry points, all routed to the same underlying
+operation — `kernel/tartine.h` and `crates/tartine-fuse/src/ioctl.rs`
+define the identical numbers, so the same `ioctl(2)` call works
+unchanged whether the mount is the kernel module or the FUSE prototype:
 
 ```c
-/* ioctl, defined in a small tartine_ioctl.h header shipped with the fs */
+/* kernel/tartine.h */
 #define TARTINE_IOC_MAGIC        'T'
 #define TARTINE_IOC_MAKE_WRITABLE   _IOW(TARTINE_IOC_MAGIC, 1, __u32 /* flags */)
 #define TARTINE_IOC_GET_STATE       _IOR(TARTINE_IOC_MAGIC, 2, struct tartine_state)
@@ -385,13 +468,15 @@ struct tartine_state {
 - `ioctl(fd, TARTINE_IOC_MAKE_WRITABLE, &flags)` — `flags` bit 0 selects
   synchronous (blocks the ioctl until conversion is fully complete) vs
   asynchronous (returns immediately, state becomes `Converting`, caller
-  polls `TARTINE_IOC_GET_STATE`). FUSE's `ioctl` op maps straightforwardly
-  to this.
+  polls `TARTINE_IOC_GET_STATE`). `.unlocked_ioctl` in the kernel module
+  and FUSE's `ioctl` op in the prototype both map straightforwardly to
+  this — `kernel/tartine_main.c`'s `tartine_file_ioctl()` is the current
+  (partial — see `kernel/README.md`) implementation.
 - `setxattr(path, "user.tartine.writable", "1", ...)` — convenience for
   tools that can't easily issue raw ioctls (shell scripts via
   `setfattr`); same async behavior as the default ioctl.
-- `tartinectl convert <path> [--wait]` — CLI wrapper over the control
-  socket, useful for batch/offline conversion and for scripting.
+- `tartinectl convert <path> [--wait]` — CLI wrapper issuing the same
+  ioctl, useful for batch/offline conversion and for scripting.
 
 ### 9.3 What conversion actually does (and why it's costly)
 
@@ -454,19 +539,28 @@ policy changed" instead of two.
 
 ## 11. Data path summary
 
-**Append write** (`AppendOnly` file): FUSE `write` → daemon validates
-offset == EOF and mode → HRW picks N data disks for `(inode, chunk_seq)` →
-parallel `io_uring` writes to all N (fan-out, wait per configured
-consistency: `all` by default, `quorum` optional for lower tail latency at
-reduced durability) → on success, metadata txn appends the chunk pointer
-(§6, synchronous 2-disk WAL) → ack to caller.
+Written from the kernel module's point of view (`write_iter`/`read_iter`
+on `struct file_operations`); the FUSE prototype's `write`/`read` handlers
+follow the identical shape one layer up.
 
-**Read**: FUSE `read` → resolve offset to chunk-log record(s) or extent(s)
-from metadata (in-memory cache, backed by the redb store) → pick one live
-replica (prefer local/least-loaded disk) → `io_uring` read + checksum
-verify → on checksum failure, retry next replica + kick repair.
+**Append write** (`AppendOnly` file): `write_iter` → `tartine_classify_write`
+validates offset == EOF and mode (§4.1, real today — see
+`kernel/tartine_main.c`) → HRW (`tartine_hrw_select`) picks N data disks
+for `(inode, chunk_seq)` → parallel `bio` writes to all N (fan-out, wait
+per configured consistency: `all` by default, `quorum` optional for lower
+tail latency at reduced durability) → on success, metadata txn appends
+the chunk pointer (§6, synchronous 2-disk WAL) → ack to caller. **Not
+implemented yet**: everything from "HRW picks N data disks" onward —
+`kernel/tartine_main.c`'s `write_iter` currently returns `-EOPNOTSUPP`
+once classification passes (`kernel/README.md`).
 
-**Random write** (`Writable` file only): FUSE `write` at arbitrary offset →
+**Read**: `read_iter` → resolve offset to chunk-log record(s) or extent(s)
+from metadata (in-memory cache, backed by the metadata B-tree) → pick one
+live replica (prefer local/least-loaded disk) → `bio` read + checksum
+verify → on checksum failure, retry next replica + kick repair. **Not
+implemented yet** — no `read_iter` at all in the current skeleton.
+
+**Random write** (`Writable` file only): `write_iter` at arbitrary offset →
 resolve/allocate extents → read-modify-write if sub-block, else direct
 overwrite → fan-out to replica set → metadata txn only needed if the
 extent map changed (new allocation, size growth), not per write.
@@ -477,29 +571,31 @@ extent map changed (new allocation, size growth), not per write.
 |---|---|---|
 | Data disk disappears | I/O error / device removal uevent | Mark `Dead` in pool map (metadata txn); chunks/extents it held are under-replicated → repair loop re-replicates from survivors to newly HRW-selected disks. |
 | Metadata disk disappears | I/O error on WAL write | Fence out of `MetaGroup`, `epoch += 1`, continue degraded (primary-only) while provisioning + resyncing a replacement (§6). |
-| Both metadata disks gone simultaneously | Daemon fails to open pool | Manual recovery: operator points daemon at any surviving data disks; namespace is unrecoverable beyond what can be reconstructed from data-disk superblocks' cached `MetaGroup`/pool-map echoes (best-effort) — this is the one true single point of failure in v1, called out explicitly in §14. |
-| Daemon crash / power loss mid-write | On restart, WAL replay | Data disks: incomplete trailing record in a segment is detected via checksum/length sanity and truncated (standard log-structured recovery). Metadata: WAL is replayed from last checkpoint on both metadata disks (they agree, since writes were synchronous); any op whose data-write never got acked is simply absent from the WAL and never happened. |
+| Both metadata disks gone simultaneously | Mount fails | Manual recovery: operator points a mount attempt at any surviving data disks; namespace is unrecoverable beyond what can be reconstructed from data-disk superblocks' cached `MetaGroup`/pool-map echoes (best-effort) — this is the one true single point of failure in v1, called out explicitly in §14. |
+| Power loss / crash mid-write | On next mount, WAL replay | Data disks: incomplete trailing record in a segment is detected via checksum/length sanity and truncated (standard log-structured recovery). Metadata: WAL is replayed from last checkpoint on both metadata disks (they agree, since writes were synchronous); any op whose data-write never got acked is simply absent from the WAL and never happened. |
 | Bit rot | Scrubber / read-time checksum mismatch | Repair from healthy replica (§8). |
 | Conversion interrupted (crash mid-`Converting`) | Inode `mode == Converting` found on restart | Discard partial extent map, resume from step 2 of §9.3 (old chunk-log is still intact and authoritative until the atomic swap in step 5, so this is always safe to restart from scratch). |
 
 ## 13. Explicit non-goal: multi-host HA
 
-Everything above assumes one daemon process owns the pool. If the
-requirement ever grows to "survive losing the whole host", the natural
-extension is an active/standby pair of `tartined` processes on two hosts
-sharing access to the same disks (multi-initiator NVMe-oF/iSCSI, or simply
-each disk being dual-ported), with leader election (now genuinely needing
-consensus, e.g. `openraft`) over *who is allowed to write* — at that point
-the "2 disks for metadata" constraint would need to be revisited alongside
-"2 hosts for the writer role" as a related but distinct decision. Called
-out here so the line between what's designed and what's future work is
-explicit.
+Everything above assumes one host's mounted kernel module owns the pool.
+If the requirement ever grows to "survive losing the whole host", the
+natural extension is active/standby mounts on two hosts sharing access to
+the same disks (multi-initiator NVMe-oF/iSCSI, or simply each disk being
+dual-ported), with leader election (now genuinely needing distributed
+consensus — out of scope for an in-kernel component, more realistically a
+small userspace arbiter the module defers to) over *who is allowed to
+write* — at that point the "2 disks for metadata" constraint would need
+to be revisited alongside "2 hosts for the writer role" as a related but
+distinct decision. Called out here so the line between what's designed
+and what's future work is explicit.
 
 ## 14. Known limitations / open questions
 
-- **Single daemon is a SPOF for availability** (not for durability — data
-  survives; the pool just can't be *served* while the daemon is down).
-  Acceptable for v1's stated scope; §13 is the extension path.
+- **A single mount is a SPOF for availability** (not for durability — data
+  survives; the pool just can't be *served* from a second host while the
+  mounting host is down). Acceptable for v1's stated scope (single host);
+  §13 is the extension path.
 - Losing both metadata disks at once loses the namespace even though file
   data may largely survive on data disks — same failure mode as losing
   both sides of any RAID-1, just for metadata instead of data. Mitigation:
@@ -516,25 +612,67 @@ explicit.
   is); a simpler v1 could instead just block *all* writes during
   conversion and document that as the cost of "costly", deferring the
   concurrent-append refinement.
-- No mandatory locking / range locking specified — POSIX advisory locks
-  (`flock`/`fcntl`) can be layered on the FUSE session using the daemon's
-  single-writer position as the natural lock authority, but that's not
-  designed here.
+- No mandatory locking / range locking specified — the VFS's standard
+  `flock`/`fcntl` advisory-lock plumbing applies to any kernel filesystem
+  more or less for free, but per-file-replica-aware semantics (if any are
+  even needed, given the single-writer model of §2) aren't designed here.
+- The kernel module (`kernel/`) is, today, VFS/kbuild plumbing plus the
+  ioctl-driven state machine — not yet a working filesystem. §15 and
+  `kernel/README.md` are explicit about exactly what's missing (block
+  I/O, the on-disk metadata B-tree, the rebalancer/scrubber) and why it
+  wasn't attempted further without a real kernel build tree to verify
+  against.
 
 ## 15. Suggested milestones
 
-1. `tartine-core`: disk superblock format, chunk-log segment read/write,
-   HRW placement — unit-testable without FUSE at all.
-2. `tartine-meta`: `redb`-backed inode table + directory tree + WAL, single
+**Phase 1 — prototype in FUSE** (validate the design where mistakes are cheap):
+
+1. ✅ `tartine-kcore`: HRW placement and the append-only/converting/writable
+   state machine, `#![no_std]`, zero dependencies, unit-tested — the one
+   implementation both phases below end up using.
+2. ✅ `tartine-core`: disk superblock format, chunk-log segment read/write
+   (own implementation of the on-disk record format tartine-kcore doesn't
+   own — §5.3), plus a thin `Vec`/`PoolMap` wrapper around
+   `tartine-kcore`'s placement.
+3. `tartine-meta`: `redb`-backed inode table + directory tree + WAL, single
    in-process metadata group (no replication yet) — enough for a
-   single-disk, non-replicated prototype.
-3. `tartine-fuse` + `tartined`: wire it up to a real mountpoint, append-only
-   writes and reads working end-to-end on one disk.
-4. Add the second metadata disk + synchronous WAL shipping (§6).
-5. Multi-disk pool + HRW-driven placement + `tartinectl disk add/remove`
-   (§7).
-6. Per-file replication factor + rebalancer (§10).
-7. The `ioctl` conversion path (§9) — last, since everything above needs
-   to be solid before "costly, one-way, background materialization" is
-   safe to build on.
-8. Scrubber/repair loop, disk-failure handling (§8, §12).
+   single-disk, non-replicated prototype. *(scaffolded, not implemented)*
+4. ✅ `tartine-fuse`: write-path state machine and ioctl surface wired to
+   `tartine-kcore`, unit-tested. *(FUSE session itself — actually mounting
+   and serving I/O — not implemented yet: `tartined`'s `main.rs` is still
+   a stub.)*
+5. Add the second metadata disk + synchronous WAL shipping (§6) to the
+   prototype.
+6. Multi-disk pool + HRW-driven placement + `tartinectl disk add/remove`
+   (§7), per-file replication factor + rebalancer (§10), scrubber/repair
+   (§8, §12) — all in the FUSE prototype first.
+
+**Phase 2 — port the validated design to `kernel/`** (production):
+
+7. ✅ Module skeleton: registration, `fs_context`-based mount, superblock
+   read+checksum+parse, minimal root inode, `tartine-kcore` linked in and
+   driving the ioctl/write-classification surface. *(Written, not
+   build-verified — no kernel headers were available where this was
+   authored; see `kernel/README.md`.)*
+8. Get it actually compiling and loading against a real kernel build
+   tree; fix the block-device-open API and any kbuild link issues
+   `kernel/README.md` flags as unverified.
+9. The on-disk metadata B-tree + 2-disk WAL replication (§6), rebuilt
+   against the block layer directly — this is the one piece Phase 1
+   deliberately didn't validate a kernel-shaped implementation of (it used
+   `redb`), so budget real design time here, not just porting time.
+10. Chunk-log/extent block I/O via `bio`/`blk-mq` (§5.3, §11) — the
+    `write_iter`/`read_iter` gap `kernel/README.md` calls out.
+11. Multi-disk pool, device-scan registry, rebalancer, scrubber (§7, §8) —
+    now driven by ioctls on the mount / control device instead of a
+    prototype daemon's in-process logic.
+12. The `ioctl` conversion path's actual materializer (§9.3 steps 2-5) —
+    last, since everything above needs to be solid before "costly,
+    one-way, background materialization" is safe to build on.
+13. Kernel-safe codegen for `tartine-kcore`'s `freestanding` build (no red
+    zone, kernel code model, verified against a real link — see
+    `kernel/README.md`'s "Making the Rust object actually kernel-safe").
+14. Golden on-disk-format test vectors shared between the FUSE prototype
+    and the kernel module's test suite, closing the gap flagged in §5.3
+    (two independent implementations of the same record layout, not
+    provably in agreement today beyond "both follow this document").

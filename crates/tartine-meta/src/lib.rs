@@ -1,12 +1,15 @@
-//! Metadata engine: inode table, directory tree, and the synchronous
-//! 2-disk WAL that replicates every mutation before it is acknowledged.
-//! See DESIGN.md §6.
+//! Metadata engine for the **FUSE prototype**: inode table, directory
+//! tree, and the synchronous 2-disk WAL that replicates every mutation
+//! before it is acknowledged. See DESIGN.md §6.
 //!
-//! The store itself (`Store` trait) is left abstract; a real build backs
+//! The store itself (`Store` trait) is left abstract; the prototype backs
 //! it with `redb` (a pure-Rust, transactional, file-backed B-tree — see
 //! the workspace `Cargo.toml` comment). What's implemented concretely
 //! here is the replication *protocol* around it, since that's the part
-//! specific to this design rather than off-the-shelf.
+//! specific to this design rather than off-the-shelf. Production
+//! (`kernel/`) reuses this same protocol but against its own in-kernel
+//! on-disk B-tree instead of `redb` — see DESIGN.md §4.1, no userspace
+//! embedded KV engine is usable from kernel context.
 
 use std::io;
 

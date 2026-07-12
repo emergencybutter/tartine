@@ -1,6 +1,12 @@
-//! `tartinectl` — CLI over `tartined`'s control socket (DESIGN.md §3).
-//! Command surface mirrors the examples used throughout DESIGN.md; each
-//! arm here is where a `tonic` client call to `tartined` would go.
+//! `tartinectl` — thin CLI issuing `ioctl(2)`s against a mounted tartine
+//! filesystem (DESIGN.md §3), the same shape as `btrfs-progs`. The same
+//! commands work unchanged against the kernel module (production,
+//! `kernel/`) or the FUSE prototype (`crates/tartine-fuse`,
+//! `crates/tartined`), since both implement the identical ioctl numbers
+//! (`kernel/tartine.h` / `tartine-fuse/src/ioctl.rs`). Command surface
+//! mirrors the examples used throughout DESIGN.md; each arm here is
+//! where an actual `ioctl(2)` call against the mountpoint (or
+//! `/dev/tartine-ctl` for pre-mount device scan) would go.
 
 use std::env;
 
@@ -39,7 +45,7 @@ fn main() {
 
 fn unimplemented(command: &[&str]) {
     eprintln!(
-        "tartinectl {}: design skeleton only — would call tartined's control socket (see DESIGN.md)",
+        "tartinectl {}: design skeleton only — would issue an ioctl(2) against the mount (see DESIGN.md)",
         command.join(" ")
     );
     std::process::exit(1);

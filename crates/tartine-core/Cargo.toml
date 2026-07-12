@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 tartine-proto = { path = "../tartine-proto" }
+tartine-kcore = { path = "../tartine-kcore" }

@@ -1,0 +1,26 @@
+[package]
+name = "tartine-kcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# staticlib: what the C kernel module links against.
+# rlib: lets tartine-fuse (the FUSE prototype) call these functions as an
+# ordinary Rust dependency, so both front ends run the literal same
+# compiled logic. See DESIGN.md "kernel/" section for why this crate is
+# alloc-free and feature-gates its own `no_std`-ness.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[features]
+# Off (default): builds as a normal `std`-linked rlib, for use as a plain
+# dependency of a std binary (tartine-fuse) — must NOT define a panic
+# handler of its own, or linking fails with "duplicate lang item:
+# panic_impl" against std's.
+#
+# On: builds `#![no_std]` with its own `#[panic_handler]`, for the
+# staticlib artifact that gets linked into the freestanding kernel
+# module, which has no libstd (or libc) underneath it at all.
+freestanding = []

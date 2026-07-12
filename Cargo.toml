@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/tartine-kcore",
     "crates/tartine-proto",
     "crates/tartine-core",
     "crates/tartine-meta",
@@ -14,14 +15,31 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-# Real dependencies a full implementation would pull in (kept out of this
-# skeleton so it builds offline with the standard library only — see
-# DESIGN.md for the rationale behind each choice):
+[profile.release]
+# tartine-kcore's `freestanding` build has no unwind runtime to unwind
+# into (see its crate doc comment); panic=abort is also the standard,
+# unsurprising choice for the daemon/CLI binaries in this workspace, so
+# it's set workspace-wide rather than only for that one crate.
+panic = "abort"
+
+# The production target is the kernel module in kernel/ (C, linking
+# tartine-kcore's staticlib output) — see DESIGN.md. This workspace's
+# other crates now split into two roles:
+#
+#   - tartine-kcore is the one piece of logic both the kernel module and
+#     the FUSE prototype run, unmodified (DESIGN.md, "kernel/" section).
+#   - tartine-core/tartine-meta/tartine-fuse/tartined are the FUSE-based
+#     prototype: a full std-linked, alloc-heavy implementation used to
+#     validate the design end-to-end before committing it to a kernel
+#     module, where mistakes are much more expensive to make. They are
+#     not what ships to production.
+#
+# Real dependencies a full prototype build would pull in (kept out of
+# this skeleton so it builds offline with the standard library only):
 #
 #   fuser   = "0.14"   # FUSE session (crates/tartine-fuse)
 #   io-uring = "0.6"   # async disk I/O (crates/tartine-core)
 #   redb    = "2"      # embedded metadata KV store (crates/tartine-meta)
-#   blake3  = "1"      # chunk/extent checksums (crates/tartine-core)
 #   serde / bincode    # on-disk record (de)serialization
-#   tonic / prost      # control-plane gRPC (tartined <-> tartinectl)
+#   tonic / prost      # prototype-only control-plane gRPC (tartined <-> tartinectl)
 #   tokio              # async runtime

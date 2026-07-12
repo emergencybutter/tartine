@@ -1,7 +1,10 @@
-//! `tartined` — the single daemon that owns a pool: mounts the namespace
+//! `tartined` — the FUSE **prototype's** daemon: mounts the namespace
 //! over FUSE, holds the metadata replicator, runs the rebalancer/scrubber,
-//! and serves the `tartinectl` control API. See DESIGN.md §3 for the
-//! overall wiring this `main` would perform in a real build:
+//! and serves the `tartinectl` control API. This exists to validate the
+//! design end-to-end in userspace before it's committed to kernel code
+//! (`kernel/`, the actual production target — see DESIGN.md's opening
+//! note and §3/§4). See DESIGN.md §3 for the overall wiring this `main`
+//! would perform in a real prototype build:
 //!
 //!   1. Read every attached disk's superblock, union their cached
 //!      `MetaGroup`/`PoolMap` echoes, pick the highest-epoch answer.
@@ -15,7 +18,7 @@
 //! workspace fit together, not to duplicate `DESIGN.md`.
 
 fn main() {
-    eprintln!("tartined: design skeleton only, no pool implementation yet");
-    eprintln!("see DESIGN.md for the architecture this binary will wire up");
+    eprintln!("tartined: FUSE prototype skeleton only, no pool implementation yet");
+    eprintln!("production target is the kernel module in kernel/ — see DESIGN.md");
     std::process::exit(1);
 }
