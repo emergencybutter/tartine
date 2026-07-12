@@ -10,5 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 tartine-proto = { path = "../tartine-proto" }
+# For crates/tartine-core/src/redundancy_spec.rs — parsing a
+# human-friendly "hdd,ssd" spec into a RedundancyScheme client-side, so
+# the kernel module never has to parse this grammar over the structured
+# ioctl path (DESIGN.md §10).
+tartine-core = { path = "../tartine-core" }
 
 # clap + tonic (as a client of tartined's control socket) in a real build.

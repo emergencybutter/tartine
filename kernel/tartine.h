@@ -11,6 +11,8 @@
 #include <linux/uuid.h>
 #include <linux/build_bug.h>
 
+#include "tartine_kcore.h" /* struct tartine_replica_slot_spec, TARTINE_CLASS_* */
+
 #define TARTINE_SB_MAGIC_STR "TARTINE1"
 #define TARTINE_SB_MAGIC_LEN 8
 /* Arbitrary 32-bit value for sb->s_magic (procfs/statfs identify a
@@ -51,9 +53,19 @@ struct tartine_sb_info {
 
 /* Per-inode state kept in-core. `mode` uses the TARTINE_MODE_* constants
  * from tartine_kcore.h directly, so it can be passed to
- * tartine_classify_write()/friends with no translation. */
+ * tartine_classify_write()/friends with no translation.
+ *
+ * `redundancy_slots`/`n_redundancy_slots` are this file's placement
+ * policy (DESIGN.md §10), stored in-core only for now — like `mode`
+ * itself, there is no metadata store yet to persist it to (that's the
+ * §6 B-tree, still TODO). New files start at n_redundancy_slots == 0
+ * ("use the pool/directory default", also not wired up yet) rather than
+ * a hardcoded default, so it's obvious when nothing has actually been
+ * configured. */
 struct tartine_inode_info {
 	__u32 mode;
+	__u32 n_redundancy_slots;
+	struct tartine_replica_slot_spec redundancy_slots[TARTINE_MAX_REDUNDANCY_SLOTS];
 	struct inode vfs_inode;
 };
 
@@ -87,6 +99,41 @@ struct tartine_state {
 };
 
 static_assert(sizeof(struct tartine_state) == 24);
+
+/*
+ * Per-file redundancy policy (DESIGN.md §10): "unreplicated on SSD",
+ * "unreplicated pinned to a specific disk", "3x whichever disks", "one
+ * HDD + one SSD so reads can hit the fast copy", and reserved syntax for
+ * future erasure coding. `tartinectl` parses the human-friendly grammar
+ * (crates/tartine-core/src/redundancy_spec.rs) into this *structured*
+ * form client-side — the kernel never parses the string form for the
+ * ioctl path, only (eventually) for the setxattr(2) convenience path,
+ * which needs its own small parser since it can't call into userspace
+ * Rust. `struct tartine_replica_slot_spec` (tartine_kcore.h) doubles as
+ * both this ioctl's wire format and tartine_place_redundancy()'s input,
+ * so no translation happens in between.
+ */
+#define TARTINE_MAX_REDUNDANCY_SLOTS TARTINE_MAX_SELECT
+
+#define TARTINE_REDUNDANCY_REPLICATED     0u
+/* Reserved, NOT IMPLEMENTED — DESIGN.md §16.6. TARTINE_IOC_SET_REDUNDANCY
+ * rejects this with -EOPNOTSUPP; it exists in the wire format now so
+ * accepting it later isn't a breaking ioctl-struct change. */
+#define TARTINE_REDUNDANCY_ERASURE_CODED  1u
+
+struct tartine_set_redundancy {
+	__u32 scheme_kind; /* TARTINE_REDUNDANCY_* */
+	__u32 n_slots;      /* valid when scheme_kind == REPLICATED */
+	__u8  data_shards;   /* valid when scheme_kind == ERASURE_CODED (reserved) */
+	__u8  parity_shards;  /* ditto */
+	__u8  _pad[6];
+	struct tartine_replica_slot_spec slots[TARTINE_MAX_REDUNDANCY_SLOTS];
+};
+
+static_assert(sizeof(struct tartine_set_redundancy) == 16 + TARTINE_MAX_REDUNDANCY_SLOTS * 24);
+
+#define TARTINE_IOC_SET_REDUNDANCY _IOW(TARTINE_IOC_MAGIC, 3, struct tartine_set_redundancy)
+#define TARTINE_IOC_GET_REDUNDANCY _IOR(TARTINE_IOC_MAGIC, 4, struct tartine_set_redundancy)
 
 /*
  * Control device (`/dev/tartine-ctl`) ioctls, used before any pool disk

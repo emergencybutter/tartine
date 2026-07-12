@@ -29,17 +29,46 @@ fn main() {
             _ => usage(),
         },
         Some("file") => match args.get(2).map(String::as_str) {
-            Some("set-replication") => unimplemented(&["file", "set-replication", "<path>", "<n>"]),
+            Some("set-redundancy") => set_redundancy(args.get(3), args.get(4)),
+            Some("get-redundancy") => unimplemented(&["file", "get-redundancy", "<path>"]),
             _ => usage(),
         },
         Some("convert") => unimplemented(&["convert", "<path>", "[--wait]"]),
         Some("fs") => match args.get(2).map(String::as_str) {
-            Some("set-default-replication") => {
-                unimplemented(&["fs", "set-default-replication", "<n>"])
+            Some("set-default-redundancy") => {
+                unimplemented(&["fs", "set-default-redundancy", "<spec>"])
             }
             _ => usage(),
         },
         _ => usage(),
+    }
+}
+
+/// `tartinectl file set-redundancy <path> <spec>` — the one command that
+/// does real work in this skeleton rather than just printing what it
+/// would do: it parses `<spec>` with `tartine_core::redundancy_spec`
+/// (DESIGN.md §10's grammar — "ssd", "disk:<uuid>", "3", "hdd,ssd",
+/// "rs:4+2") and reports back the resulting `RedundancyScheme`, so the
+/// parser and its error messages are exercised end-to-end even though
+/// the actual `TARTINE_IOC_SET_REDUNDANCY` ioctl call is still a stub.
+fn set_redundancy(path: Option<&String>, spec: Option<&String>) {
+    let (Some(path), Some(spec)) = (path, spec) else {
+        eprintln!("usage: tartinectl file set-redundancy <path> <spec>");
+        std::process::exit(2);
+    };
+
+    match tartine_core::redundancy_spec::parse(spec) {
+        Ok(scheme) => {
+            eprintln!("tartinectl file set-redundancy {path} {spec:?}: parsed as {scheme:?}");
+            eprintln!(
+                "design skeleton only — would issue TARTINE_IOC_SET_REDUNDANCY against {path} (see DESIGN.md §10)"
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("tartinectl: invalid redundancy spec {spec:?}: {e}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -53,7 +82,7 @@ fn unimplemented(command: &[&str]) {
 
 fn usage() {
     eprintln!(
-        "usage: tartinectl <disk add|disk remove|meta set-disks|file set-replication|convert|fs set-default-replication> ..."
+        "usage: tartinectl <disk add|disk remove|meta set-disks|file set-redundancy|file get-redundancy|convert|fs set-default-redundancy> ..."
     );
     std::process::exit(2);
 }

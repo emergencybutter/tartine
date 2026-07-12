@@ -36,6 +36,7 @@
 #include <linux/crc32.h>
 #include <linux/uuid.h>
 #include <linux/mount.h>
+#include <linux/string.h>
 
 #include "tartine.h"
 #include "tartine_kcore.h"
@@ -58,6 +59,10 @@ static struct inode *tartine_alloc_inode(struct super_block *sb)
 	if (!ti)
 		return NULL;
 	ti->mode = TARTINE_MODE_APPEND_ONLY;
+	/* n_redundancy_slots == 0 means "no policy set" (TARTINE_IOC_
+	 * GET_REDUNDANCY DESIGN.md §10) — must be explicit, not whatever
+	 * was left in this slab object by its previous occupant. */
+	ti->n_redundancy_slots = 0;
 	return &ti->vfs_inode;
 }
 
@@ -134,6 +139,56 @@ static long tartine_file_ioctl(struct file *file, unsigned int cmd, unsigned lon
 		};
 
 		if (copy_to_user((void __user *)arg, &state, sizeof(state)))
+			return -EFAULT;
+		return 0;
+	}
+	case TARTINE_IOC_SET_REDUNDANCY: {
+		struct tartine_set_redundancy req;
+
+		/* Changes which/how many disks hold this file's data —
+		 * same restriction as MAKE_WRITABLE and for the same
+		 * reason (DESIGN.md §10). */
+		if (!inode_owner_or_capable(file_mnt_idmap(file), inode))
+			return -EPERM;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		if (req.scheme_kind == TARTINE_REDUNDANCY_ERASURE_CODED) {
+			/* Reserved syntax, DESIGN.md §16.6 — accepted by the
+			 * struct/parser so the wire format won't need to
+			 * change when this ships, rejected here because
+			 * nothing downstream (placement, repair, read) can
+			 * act on it yet. */
+			return -EOPNOTSUPP;
+		}
+		if (req.scheme_kind != TARTINE_REDUNDANCY_REPLICATED)
+			return -EINVAL;
+		if (req.n_slots == 0 || req.n_slots > TARTINE_MAX_REDUNDANCY_SLOTS)
+			return -EINVAL;
+
+		/*
+		 * TODO(DESIGN.md §6, §10): this should be a MetaOp::
+		 * SetRedundancyScheme transaction (durable, replicated to
+		 * both metadata disks) followed by the rebalancer
+		 * converging actual placement in the background — neither
+		 * exists yet (no metadata store, no rebalancer). Storing
+		 * directly into the in-core inode is a placeholder with
+		 * the same "real logic, no persistence" scope as `mode`
+		 * above; it does NOT survive umount.
+		 */
+		ti->n_redundancy_slots = req.n_slots;
+		memcpy(ti->redundancy_slots, req.slots, req.n_slots * sizeof(req.slots[0]));
+		return 0;
+	}
+	case TARTINE_IOC_GET_REDUNDANCY: {
+		struct tartine_set_redundancy resp = {
+			.scheme_kind = TARTINE_REDUNDANCY_REPLICATED,
+			.n_slots = ti->n_redundancy_slots,
+		};
+
+		memcpy(resp.slots, ti->redundancy_slots, ti->n_redundancy_slots * sizeof(resp.slots[0]));
+		if (copy_to_user((void __user *)arg, &resp, sizeof(resp)))
 			return -EFAULT;
 		return 0;
 	}

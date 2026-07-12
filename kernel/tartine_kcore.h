@@ -18,6 +18,15 @@
 #include <linux/types.h>
 #include <linux/build_bug.h>
 
+/* Disk class values, shared between tartine_disk_candidate::class (a
+ * disk's actual class — never TARTINE_CLASS_ANY) and
+ * tartine_redundancy_slot::required_class (where ANY is the common
+ * case). Mirror tartine_kcore::placement::CLASS_*. */
+#define TARTINE_CLASS_ANY  0u
+#define TARTINE_CLASS_HDD  1u
+#define TARTINE_CLASS_SSD  2u
+#define TARTINE_CLASS_NVME 3u
+
 /* Mirrors tartine_kcore::placement::DiskCandidate (#[repr(C)]). Weight is
  * fixed-point (real_weight * 1000): kernel code must not touch the FPU
  * casually, so there is no f64 anywhere on this boundary. Selection
@@ -29,11 +38,13 @@ struct tartine_disk_candidate {
 	__u64 disk_id_lo;
 	__u32 weight_milli;
 	__u8  active;
+	__u8  class; /* TARTINE_CLASS_HDD/SSD/NVME */
 };
 
 /* Layout contract with the Rust side (which carries the matching
  * compile-time asserts): if either side drifts, the build fails instead
- * of the FFI silently misreading memory. */
+ * of the FFI silently misreading memory. Adding `class` didn't grow the
+ * struct — it fills a byte that was already implicit alignment padding. */
 static_assert(sizeof(struct tartine_disk_candidate) == 24);
 
 #define TARTINE_MAX_SELECT 16u
@@ -48,6 +59,37 @@ static_assert(sizeof(struct tartine_disk_candidate) == 24);
 size_t tartine_hrw_select(const struct tartine_disk_candidate *candidates,
 			   size_t n_candidates, __u64 key, __u32 *out,
 			   size_t n_out);
+
+/* Mirrors tartine_kcore::placement::ReplicaSlotSpec (#[repr(C)]). One
+ * entry per desired replica of a file's redundancy policy (DESIGN.md
+ * §10): either "any Active disk of required_class" (TARTINE_CLASS_ANY =
+ * no constraint), or if `pinned` is set, exactly the disk named by
+ * pinned_id_{hi,lo} — HRW is not consulted for a pinned slot. */
+struct tartine_replica_slot_spec {
+	__u8  required_class;
+	__u8  pinned;
+	__u8  _pad[2];
+	__u64 pinned_id_hi;
+	__u64 pinned_id_lo;
+};
+static_assert(sizeof(struct tartine_replica_slot_spec) == 24);
+
+/* Sentinel written to out[i] by tartine_place_redundancy() when slot i
+ * couldn't be satisfied. Mirrors tartine_kcore::placement::UNPLACED. */
+#define TARTINE_UNPLACED 0xffffffffu
+
+/*
+ * General placement: walks `slots` in order, excluding disks already
+ * chosen for an earlier slot of the same file, writing each slot's
+ * chosen candidate index (or TARTINE_UNPLACED) into out[i]. For the
+ * uniform "N any disks" case this selects exactly what
+ * tartine_hrw_select() would — see the Rust side's module doc comment
+ * for why simple replication is deliberately not a separate mechanism.
+ */
+size_t tartine_place_redundancy(const struct tartine_disk_candidate *candidates,
+				 size_t n_candidates, __u64 key,
+				 const struct tartine_replica_slot_spec *slots,
+				 size_t n_slots, __u32 *out, size_t n_out);
 
 /* Placement key for (inode, chunk_seq) / (inode, extent_index). */
 __u64 tartine_hash_key(__u64 inode, __u64 seq);

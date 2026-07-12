@@ -19,15 +19,20 @@ target.
   crate — it is not reimplemented in C.
 - **Real VFS/kbuild plumbing**: module init/exit, `file_system_type`
   registration via the modern `fs_context` mount API, superblock
-  read+checksum+parse (`tartine_fill_super`), a minimal root inode, and
-  the `ioctl(2)` surface for the append→writable conversion trigger
-  (DESIGN.md §9.2).
+  read+checksum+parse (`tartine_fill_super`), a minimal root inode, the
+  `ioctl(2)` surface for the append→writable conversion trigger
+  (DESIGN.md §9.2), and the redundancy-policy get/set ioctls
+  (`TARTINE_IOC_{SET,GET}_REDUNDANCY`, DESIGN.md §10.3) — the latter are
+  real against in-core inode state (same fidelity as `mode` itself: no
+  metadata store yet, so nothing here survives `umount`).
 - **Stubbed, explicitly, with `TODO(DESIGN.md §...)` comments at each
   site**: actual chunk-log/extent I/O against the block layer (every
-  `write_iter`/`read_iter` call returns `-EOPNOTSUPP` right now), the
-  on-disk metadata B-tree and its 2-disk WAL replication, the
-  rebalancer/scrubber, and the device-scan registry the control device
-  (`/dev/tartine-ctl`) is meant to populate. These are large enough that
+  `write_iter`/`read_iter` call returns `-EOPNOTSUPP` right now — this
+  includes actually *using* a placed redundancy policy, which today only
+  gets accepted and echoed back, not acted on), the on-disk metadata
+  B-tree and its 2-disk WAL replication, the rebalancer/scrubber, and the
+  device-scan registry the control device (`/dev/tartine-ctl`) is meant
+  to populate. These are large enough that
   writing them by hand with no kernel build tree to compile/test against
   would produce code of unknown correctness — worse than being explicit
   about the gap.

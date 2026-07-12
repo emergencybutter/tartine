@@ -89,14 +89,14 @@ pub fn complete_convert(inode: &mut InodeRecord, extents: Vec<tartine_proto::Ext
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tartine_proto::DataLocator;
+    use tartine_proto::{DataLocator, RedundancyScheme, ReplicaSlot};
 
     fn append_only_inode(size: u64) -> InodeRecord {
         InodeRecord {
             inode: 1,
             mode: InodeMode::AppendOnly,
             size,
-            replication_factor: 2,
+            redundancy: RedundancyScheme::Replicated(vec![ReplicaSlot::AnyOfClass(None); 2]),
             data: DataLocator::ChunkLog(vec![]),
             uid: 0,
             gid: 0,

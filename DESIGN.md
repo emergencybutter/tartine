@@ -27,8 +27,9 @@ module is real versus stubbed today.
 
 - Disks (block devices) can be added to and removed from a *pool* while the
   filesystem is mounted and in use, without downtime.
-- Every file has an independently configurable replication factor (how many
-  disks hold a copy of its data).
+- Every file has an independently configurable redundancy policy: how
+  many replicas, which disk class(es) they must land on, and optionally
+  a specific disk to pin a replica to (§10).
 - Filesystem metadata (namespace, inode table, chunk maps) is replicated
   synchronously across exactly **2** disks by default, and the pair of disks
   backing metadata can be changed (planned migration or failure-driven
@@ -264,9 +265,9 @@ B-tree in production, a `redb` database file in the FUSE prototype — §4)
 containing:
 
 - **inode table**: `inode_id -> InodeRecord` (mode flags including
-  `AppendOnly | Converting | Writable`, size, replication_factor, owner,
-  timestamps, xattrs, and either a chunk-log pointer list or an extent map
-  depending on state).
+  `AppendOnly | Converting | Writable`, size, redundancy policy (§10),
+  owner, timestamps, xattrs, and either a chunk-log pointer list or an
+  extent map depending on state).
 - **directory tree**: `(parent_inode, name) -> inode_id`, plus a reverse
   `inode_id -> (parent_inode, name)` for `..`/hardlink accounting.
 - **pool map**: current disk membership, roles, epoch, health state.
@@ -588,24 +589,127 @@ keeps the write-path invariants simple (a file's mode fully determines
 which of the two very different write paths applies, with no third
 "has-been-converted-back" case to reason about).
 
-## 10. Per-file replication factor
+## 10. Per-file redundancy policy
 
-`InodeRecord.replication_factor: u8` — set at creation from a
-directory/pool default (`tartinectl fs set-default-replication N`), and
-changeable per file at any time:
+A file's redundancy isn't just a replica *count* — it's a list of
+replica *slots*, each independently constrained. This is what makes all
+of the following expressible as the same mechanism instead of special
+cases bolted onto each other:
+
+- "unreplicated, on SSD" — one slot, class = SSD.
+- "unreplicated, on this particular disk" — one slot, pinned to a disk.
+- "replicated 3 times, whichever disks" — three slots, no constraint.
+- "one HDD and one SSD, so reads are SSD-fast" — two slots, classes
+  HDD and SSD.
+
+```rust
+enum DiskClass { Hdd, Ssd, Nvme }
+
+enum ReplicaSlot {
+    AnyOfClass(Option<DiskClass>),  // None = no constraint (today's default)
+    Pinned(DiskId),
+}
+
+enum RedundancyScheme {
+    Replicated(Vec<ReplicaSlot>),
+    /// Reserved, not implemented — §16.6.
+    ErasureCoded { data_shards: u8, parity_shards: u8 },
+}
+```
+
+`InodeRecord.redundancy: RedundancyScheme` replaces the earlier scalar
+`replication_factor: u8`. `RedundancyScheme::replica_count()` is what
+that scalar becomes when only the count matters (rebalancer bookkeeping,
+`statfs` estimates); `Replicated(slots).len() == N` recovers the old
+"replicated N times" behavior exactly, since `AnyOfClass(None)` for
+every slot places identically to unconstrained HRW (verified by
+`tartine-kcore`'s `place_redundancy_matches_hrw_select_for_uniform_any_slots`
+test — the general mechanism reproduces the simple case bit-for-bit, not
+just approximately).
+
+### 10.1 Disk classes
+
+`DiskEntry.class: DiskClass` is set at `disk add` time: auto-detected
+from the block device's rotational flag (`blk_queue_is_rotational()` —
+distinguishes HDD from everything else) with a manual override
+(`tartinectl disk add /dev/nvme1n1 --class nvme`), since auto-detection
+alone can't tell NVMe from SATA SSD and is sometimes wrong for
+virtual/passthrough devices. Three classes today (HDD/SSD/NVMe) rather
+than open-ended operator-defined tags (the way Ceph CRUSH device classes
+work) — deliberately: a fixed small enum is what lets
+`DiskCandidate::class` stay a plain `u8` across the kernel FFI boundary
+with no string interning. If per-deployment tags turn out to be needed,
+the natural extension is to intern them pool-wide into small integers at
+`disk add` time and keep the wire format exactly as-is — noted here as a
+clean extension point, not designed further since nothing in the current
+requirements needs it.
+
+### 10.2 Placement: one slot at a time, excluding what's already placed
+
+`tartine-kcore::placement::place_redundancy` (DESIGN.md §7.2's HRW,
+generalized) walks a file's slot list in order. For each slot: if it's
+pinned, the named disk is used directly (no HRW — it's a lookup, not a
+score); otherwise HRW selects the highest-scoring `Active` disk of the
+required class, excluding every disk already chosen for an earlier slot
+of the *same* file, so two slots can never collide on one disk. This is
+exactly the exclusion loop `hrw_select`'s multi-replica case always used
+internally — §7.2's "any disk" replication was already a special case of
+this, it just didn't have a name for the general form until per-slot
+constraints made one necessary.
+
+An unsatisfiable slot (no HDD in the pool when one was requested; the
+pinned disk is gone) reports that slot as unplaced rather than failing
+the whole call — DESIGN.md §7.4's "under-replicated, repair when
+possible" framing applies per-slot, so one bad constraint doesn't block
+the other slots of the same file from being placed. What differs is what
+happens *next*: at policy-set time (§10.3) an unsatisfiable slot is a
+hard error (the operator asked for something the pool can't currently
+provide, and silently accepting it would be misleading); for an
+already-placed file whose class later runs out of room, it's ordinary
+under-replication that the repair loop (§8) retries.
+
+**Pinning's tradeoff, stated plainly**: a pinned slot has no fallback by
+construction. If the pinned disk is gone, that replica is gone — there
+is no "pin failed, pick another disk" behavior, because that would
+silently defeat the reason to pin something (a locality/latency
+guarantee, e.g. "this replica must be on the disk attached to this GPU
+node") in favor of a resilience guarantee the operator didn't ask this
+particular slot to provide. An operator who wants both locality *and*
+a fallback expresses that as two slots: one pinned, one
+class-constrained or unconstrained.
+
+### 10.3 Setting and changing the policy
 
 ```
-tartinectl file set-replication <path> <N>
-# or: setfattr -n user.tartine.replication -v N <path>
+tartinectl file set-redundancy <path> <spec>
+tartinectl file get-redundancy <path>
+tartinectl fs set-default-redundancy <spec>   # applied to newly created files
+# or: setfattr -n user.tartine.redundancy -v <spec> <path>
 ```
 
-Changing it doesn't move data synchronously — it just updates the target N
-in metadata and lets the same rebalancer used for disk add/remove (§7.3)
-converge the file's actual replica count to the new target in the
-background (add replicas by copying from an existing one via HRW; remove
-excess replicas by deleting from the disks no longer in the top-N set).
-This reuses one mechanism for "pool topology changed" and "this file's
-policy changed" instead of two.
+`<spec>` is the compact grammar `crates/tartine-core/src/redundancy_spec.rs`
+implements and tests: a bare integer (`3`) for N unconstrained replicas;
+otherwise a comma-separated list of slots, each `any` / `hdd` / `ssd` /
+`nvme` / `disk:<uuid>` (`ssd`, `disk:<uuid>`, `hdd,ssd`); or `rs:<k>+<m>`
+for the reserved erasure-coding syntax (§16.6). `tartinectl` parses this
+client-side and issues the *structured* ioctl
+(`TARTINE_IOC_SET_REDUNDANCY`, `kernel/tartine.h`) — the kernel module
+never parses this grammar for the ioctl path, only (eventually) for the
+`setxattr(2)` convenience path, which needs its own small hand-written
+parser since it can't call into userspace Rust.
+
+Changing the policy doesn't move data synchronously — same as the
+original scalar design, generalized: it updates the target
+`RedundancyScheme` in metadata and lets the rebalancer (§7.3's mechanism,
+unchanged) converge actual placement to it in the background, honoring
+whatever slot constraints changed (add replicas by placing new slots;
+remove excess by deleting whichever placed disks are no longer named by
+any slot; move a class-constrained replica if its disk's class no longer
+matches; move a pinned replica if the pin target changed). One mechanism
+still covers "pool topology changed", "this file's policy changed", and
+now "this file's per-slot constraints changed" — the rebalancer's job
+was already "converge actual placement to target placement," and slots
+didn't change what that job is, only what "target" can express.
 
 ## 11. Data path summary
 
@@ -824,3 +928,53 @@ already respects. Writable files would need real CoW extents and are
 explicitly *not* included. Worth doing early only because it's nearly
 free on this layout and pins down record-refcounting semantics the
 compactor needs anyway; otherwise it stays future work.
+
+### 16.6 Erasure coding (Reed-Solomon) — reserved, not implemented
+
+Requested direction, not yet designed in depth: `RedundancyScheme::ErasureCoded
+{ data_shards, parity_shards }` (§10) reserves the type and wire-format
+space (`kernel/tartine.h`'s `TARTINE_REDUNDANCY_ERASURE_CODED`,
+`crates/tartine-core/src/redundancy_spec.rs`'s `"rs:k+m"` syntax) so
+adopting it later doesn't force an on-disk or ioctl format break. Every
+placement/read/write/repair path rejects it today
+(`PlaceError::ErasureCodedUnimplemented` in `tartine-core`,
+`-EOPNOTSUPP` in `kernel/tartine_main.c`).
+
+What actually implementing it would need, sketched at the depth worth
+recording now without committing to specifics that should be decided
+against real workload data:
+
+- **Placement**: a `(k, m)` stripe spans `k + m` disks chosen the same
+  way a replicated file's slots are (`place_redundancy`, one slot per
+  shard, no class/pin constraint needed for parity shards specifically
+  but not precluded either) — the placement *mechanism* generalizes for
+  free; what's new is shard *encoding*, not shard *placement*.
+- **Write path**: erasure coding is fundamentally incompatible with the
+  append-only chunk-log's per-append independence (§9.1) — computing
+  parity needs a full stripe's worth of data, not one append at a time.
+  The natural fit is at the append→writable conversion boundary (§9.3):
+  materialize into EC stripes instead of plain extents when the target
+  scheme is `ErasureCoded`, meaning EC files are implicitly writable-only
+  in practice even though the type doesn't force that. Append-only files
+  requesting EC would need either buffering appends until a full stripe
+  accumulates (latency cost) or a smaller-than-optimal partial-stripe
+  encoding for the tail (space cost) — an open question, not resolved
+  here.
+- **Read path**: reconstruct from `k` of the `k + m` shards on a missing
+  shard, same cost/complexity class as replica-set fallback (§8) but
+  with actual RS math instead of "read the other copy."
+- **Repair**: losing a disk that held a shard means a full-stripe
+  reconstruction (read `k` shards, recompute, write the replacement) —
+  meaningfully more expensive per-lost-shard than replicated repair
+  (§8's "copy from a surviving replica"), which is the standard EC
+  resilience/repair-cost tradeoff, not specific to this design.
+- **Kernel constraints**: RS arithmetic is GF(2^8) polynomial math —
+  no floating point (already a constraint everywhere else in this
+  design, §4.1) and ideally using `CONFIG_RAID6_PQ`'s existing kernel
+  GF(2^8) routines (already present for `md` RAID6) rather than a new
+  from-scratch implementation, if the algebra lines up — worth checking
+  before writing anything, not assumed here.
+
+None of this is scheduled; it's recorded so the reservation in §10's
+types is traceable to an actual plan rather than a placeholder with no
+follow-through.

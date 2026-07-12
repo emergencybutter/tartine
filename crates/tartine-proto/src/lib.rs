@@ -45,10 +45,35 @@ pub enum DiskState {
     Dead,
 }
 
+/// A disk's storage tier, for per-file class constraints (DESIGN.md
+/// §10 — "on SSD", "one HDD and one SSD", ...). Auto-detected at `disk
+/// add` time (rotational flag) with a manual override, since
+/// auto-detection alone can't tell NVMe from SATA SSD and is sometimes
+/// wrong for virtual/passthrough devices — see DESIGN.md §10.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskClass {
+    Hdd,
+    Ssd,
+    Nvme,
+}
+
+impl DiskClass {
+    /// Matches `tartine_kcore::placement::CLASS_*` / `TARTINE_CLASS_*`
+    /// (kernel/tartine.h) — the one place this mapping is defined.
+    pub fn to_ffi(self) -> u8 {
+        match self {
+            DiskClass::Hdd => 1,
+            DiskClass::Ssd => 2,
+            DiskClass::Nvme => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiskEntry {
     pub roles: DiskRoles,
     pub state: DiskState,
+    pub class: DiskClass,
     /// Relative placement weight, default proportional to capacity.
     pub weight: f64,
     pub used_bytes: u64,
@@ -142,15 +167,58 @@ pub enum DataLocator {
     Extents(Vec<Extent>),
 }
 
+/// One replica slot in a file's redundancy policy (DESIGN.md §10):
+/// either "any Active disk of this class" (`None` = no class
+/// constraint, today's default) or "this exact disk". A pinned slot
+/// trades resilience for a locality/latency guarantee — if the pinned
+/// disk is gone, that replica simply isn't there; there is no fallback,
+/// by design (that's what pinning means).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaSlot {
+    AnyOfClass(Option<DiskClass>),
+    Pinned(DiskId),
+}
+
+/// A file's full redundancy policy (DESIGN.md §10). `Replicated` is
+/// everything implemented today — N full copies, each with its own slot
+/// constraint, so "3x whichever disks", "1x pinned to a specific disk",
+/// and "one HDD + one SSD" are all just different slot lists rather than
+/// different mechanisms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedundancyScheme {
+    Replicated(Vec<ReplicaSlot>),
+    /// Reserved, **not implemented** — every write/read/repair/convert
+    /// path rejects this variant today. It exists in the type now so
+    /// `InodeRecord`'s on-disk representation doesn't need a breaking
+    /// format migration once Reed-Solomon actually ships. See
+    /// DESIGN.md §16.6.
+    ErasureCoded {
+        data_shards: u8,
+        parity_shards: u8,
+    },
+}
+
+impl RedundancyScheme {
+    pub fn replica_count(&self) -> usize {
+        match self {
+            RedundancyScheme::Replicated(slots) => slots.len(),
+            RedundancyScheme::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (*data_shards as usize) + (*parity_shards as usize),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InodeRecord {
     pub inode: InodeId,
     pub mode: InodeMode,
     pub size: u64,
-    /// Desired replica count for this file's data; independent of the
-    /// pool-wide metadata replication factor, which is always 2 in v1.
-    /// See DESIGN.md §10.
-    pub replication_factor: u8,
+    /// This file's redundancy policy; independent of the pool-wide
+    /// metadata replication factor, which is always 2 in v1. See
+    /// DESIGN.md §10.
+    pub redundancy: RedundancyScheme,
     pub data: DataLocator,
     pub uid: u32,
     pub gid: u32,
@@ -184,9 +252,9 @@ pub enum MetaOp {
         inode: InodeId,
         extents: Vec<Extent>,
     },
-    SetReplicationFactor {
+    SetRedundancyScheme {
         inode: InodeId,
-        factor: u8,
+        scheme: RedundancyScheme,
     },
     PoolMapChange(PoolMap),
     MetaGroupChange(MetaGroup),

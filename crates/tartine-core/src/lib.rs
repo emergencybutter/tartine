@@ -5,4 +5,5 @@
 
 pub mod disk;
 pub mod placement;
+pub mod redundancy_spec;
 pub mod segment;
