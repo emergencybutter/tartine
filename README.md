@@ -12,7 +12,9 @@ step used to validate the design before committing it to kernel code, not
 an alternative production target.
 
 See **[DESIGN.md](DESIGN.md)** for the full architecture and rationale,
-and **[kernel/README.md](kernel/README.md)** for exactly what in the
+**[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)** for the ordered
+milestone plan that turns it into working code, and
+**[kernel/README.md](kernel/README.md)** for exactly what in the
 kernel module is real versus stubbed today (short version: VFS
 registration and the ioctl/write-classification surface are wired up and
 call into tested Rust logic; block I/O, the on-disk metadata B-tree, and
