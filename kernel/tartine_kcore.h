@@ -16,16 +16,25 @@
 #define TARTINE_KCORE_H
 
 #include <linux/types.h>
+#include <linux/build_bug.h>
 
 /* Mirrors tartine_kcore::placement::DiskCandidate (#[repr(C)]). Weight is
  * fixed-point (real_weight * 1000): kernel code must not touch the FPU
- * casually, so there is no f64 anywhere on this boundary. */
+ * casually, so there is no f64 anywhere on this boundary. Selection
+ * probability is exactly proportional to weight — the Rust side scores
+ * with logarithmic weighted rendezvous (Thaler-Ravishankar), not the
+ * biased hash-times-weight shortcut. */
 struct tartine_disk_candidate {
 	__u64 disk_id_hi;
 	__u64 disk_id_lo;
 	__u32 weight_milli;
 	__u8  active;
 };
+
+/* Layout contract with the Rust side (which carries the matching
+ * compile-time asserts): if either side drifts, the build fails instead
+ * of the FFI silently misreading memory. */
+static_assert(sizeof(struct tartine_disk_candidate) == 24);
 
 #define TARTINE_MAX_SELECT 16u
 

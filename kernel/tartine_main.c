@@ -89,6 +89,11 @@ static long tartine_file_ioctl(struct file *file, unsigned int cmd, unsigned lon
 		__u32 flags;
 		int new_mode;
 
+		/* Conversion changes write semantics for every open fd on
+		 * this file — restrict it like chmod: owner or CAP_FOWNER. */
+		if (!inode_owner_or_capable(file_mnt_idmap(file), inode))
+			return -EPERM;
+
 		if (copy_from_user(&flags, (void __user *)arg, sizeof(flags)))
 			return -EFAULT;
 
@@ -188,6 +193,10 @@ static const struct file_operations tartine_file_fops = {
 	.owner = THIS_MODULE,
 	.write_iter = tartine_file_write_iter,
 	.unlocked_ioctl = tartine_file_ioctl,
+	/* All tartine ioctl structs use fixed-width fields with explicit
+	 * padding (tartine.h), so 32-bit userspace needs only the pointer
+	 * translation compat_ptr_ioctl provides. */
+	.compat_ioctl = compat_ptr_ioctl,
 	.llseek = generic_file_llseek,
 	/* TODO: .read_iter (DESIGN.md §11's read path), .mmap once
 	 * Writable files exist. */
@@ -432,6 +441,7 @@ static long tartine_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long
 static const struct file_operations tartine_ctl_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = tartine_ctl_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 static struct miscdevice tartine_ctl_dev = {

@@ -22,6 +22,7 @@ pub fn get_state(inode: &InodeRecord, bytes_converted: u64) -> TartineState {
     };
     TartineState {
         mode,
+        _pad: 0,
         bytes_total: inode.size,
         bytes_converted: if inode.mode == InodeMode::Converting {
             bytes_converted

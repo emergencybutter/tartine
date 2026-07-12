@@ -47,8 +47,9 @@ module is real versus stubbed today.
   to the one host. (§13 sketches the extension.)
 - POSIX byte-range mandatory locking, full extended-ACL semantics — basic
   POSIX permissions/xattrs only.
-- Snapshots/clones (natural future extension given the log-structured
-  layout, not designed here).
+- Snapshots/clones — not designed here, but the chunk-log layout makes
+  them nearly free for append-only files, so they're tracked as a cheap
+  follow-on rather than a distant maybe (§16.5).
 
 ## 2. Why this is a *pooling* filesystem, not a distributed one
 
@@ -308,6 +309,18 @@ or automatic on failure):
   replacement backup from the pool (best free space / lowest utilization)
   and streams a full resync. This mirrors how ZFS handles a mirrored ZIL
   vdev losing a member.
+
+  **Fence durability ordering** (load-bearing — getting this wrong is an
+  unrecoverable on-disk mistake): the fence record (new epoch + new
+  membership) must be durable on the surviving metadata disk **and**
+  acknowledged into the superblock echoes of a majority of the pool's
+  disks *before the first degraded-mode write is acknowledged to any
+  caller*. Without that ordering, a crash during degraded operation
+  followed by the *old* backup reappearing leaves two self-consistent
+  metadata stores whose epochs can tie — metadata split-brain, with
+  recovery unable to tell which side carries the post-fence writes. With
+  it, the majority of superblock echoes always names the surviving side
+  before any write exists that only the surviving side has.
 - On mount, the module reads the superblock `last_seen_epoch` + a small
   fixed well-known location pointer on *every* disk in the pool (not just
   metadata disks) that records "who is the current metadata group" — this
@@ -316,7 +329,13 @@ or automatic on failure):
   neither current metadata replica. Practically: each disk's superblock
   carries a cached copy of the last known `MetaGroup`; mount unions what
   it finds across all present disks (via the device-scan registry, §3)
-  and picks the highest-epoch, majority-agreeing answer to open.
+  and opens the highest-epoch answer confirmed by a majority of echoes.
+  If the surviving evidence is **ambiguous** — e.g. both metadata disks
+  claim the same epoch with different membership, or no majority of
+  echoes agrees — mount *refuses* with a clear error rather than
+  guessing; an operator can override with an explicit
+  `tartinectl pool adopt <disk>` that names which side to treat as
+  authoritative (and thereby knowingly discards the other side's tail).
 
 **Scaling beyond one metadata group** (future, not required by the spec but
 worth noting): shard the namespace by directory hash into N independent
@@ -351,12 +370,26 @@ immediately consistent for all placement decisions.
 
 For each file, data placement needs to answer: *given replication factor
 N, which N (of the currently active) data disks hold this chunk?* We use
-**highest random weight (rendezvous) hashing**:
+**logarithmic weighted rendezvous hashing** (Thaler–Ravishankar):
 
 ```
-score(disk, key) = hash(disk.id || key) * weight_factor(disk)
-targets(key, n)  = top-n disks by score(disk, key), disk.state == Active
+u(disk, key)     = hash(disk.id || key) / 2^64        // uniform in (0, 1]
+score(disk, key) = weight(disk) / -ln(u(disk, key))
+targets(key, n)  = top-n Active disks by score, skipping disks with no free space
 ```
+
+A note on the weighting, because the obvious shortcut is wrong: scoring
+with `hash * weight` does **not** give capacity-proportional placement —
+for two disks weighted 2:1 it hands the heavier disk 75% of keys instead
+of the proportional 66.7%, and the skew compounds as the pool grows, so
+big disks fill even faster than their capacity justifies. The logarithmic
+form above is exactly proportional (each disk wins with probability
+`wᵢ/Σw`). Since `-ln u` and `-log2 u` differ only by a constant factor
+that cancels in comparisons, `tartine-kcore` implements this FPU-free
+with a fixed-point Q16 `-log2` (integer square-and-shift, exact bits, no
+tables) — see `crates/tartine-kcore/src/placement.rs`, including a
+statistical unit test whose tolerance band deliberately excludes the
+biased shortcut's output.
 
 Properties that make this a good fit for a *single-node, dynamically
 resized* pool (as opposed to CRUSH, which is designed for the harder
@@ -373,6 +406,19 @@ multi-node/rack/datacenter failure-domain problem Ceph solves):
 - `key` is `(inode_id, chunk_seq)` for data chunks, so each chunk of a large
   file can land on a different subset of disks — spreading a single hot
   file across the whole pool's bandwidth rather than pinning it to N disks.
+
+**Full disks and ENOSPC**: HRW's ranking is treated as a *preference
+list*, not a verdict — at write time the allocator walks down the ranked
+list skipping disks that are full (or `Draining`/`Dead`), so a write only
+fails with `ENOSPC` when fewer than N disks in the whole pool can accept
+it. This costs nothing extra: the chosen replica set is recorded in the
+chunk's metadata anyway (reads never recompute placement), and the
+rebalancer treats "placed below HRW rank because the preferred disk was
+full" exactly like any other deviation to converge later. `statfs`
+reports **physical** pool capacity and free space; how many logical bytes
+that translates to depends on each file's replication factor, which is
+the honest answer (`df` on a pool of mixed RF files has no single logical
+number).
 
 ### 7.3 Adding a disk
 
@@ -460,6 +506,7 @@ unchanged whether the mount is the kernel module or the FUSE prototype:
 
 struct tartine_state {
     __u32 mode;        /* TARTINE_MODE_APPEND_ONLY | _CONVERTING | _WRITABLE */
+    __u32 _pad;        /* explicit — see below */
     __u64 bytes_total;
     __u64 bytes_converted;   /* progress while _CONVERTING */
 };
@@ -477,6 +524,22 @@ struct tartine_state {
   `setfattr`); same async behavior as the default ioctl.
 - `tartinectl convert <path> [--wait]` — CLI wrapper issuing the same
   ioctl, useful for batch/offline conversion and for scripting.
+
+Two ABI/permission details that are cheap now and expensive to retrofit:
+
+- **Explicit padding**: `_pad` above is not decorative. Without it,
+  64-bit compilers insert 4 invisible bytes before `bytes_total` and
+  32-bit compilers don't, so `sizeof(struct tartine_state)` — which the
+  `_IOR` macro encodes into the command number — differs between 32- and
+  64-bit userspace, and one of the two gets `-ENOTTY`. With all fields
+  fixed-width and padding explicit, `.compat_ioctl = compat_ptr_ioctl`
+  is the only 32-bit-compat plumbing needed. Both definitions
+  (`kernel/tartine.h`, `crates/tartine-fuse/src/ioctl.rs`) carry
+  compile-time size asserts so drift fails the build.
+- **Permission**: conversion changes write semantics for every open fd
+  on the file, so it's restricted like `chmod`: file owner or
+  `CAP_FOWNER` (`inode_owner_or_capable()` in the kernel module), not
+  merely "can open for write".
 
 ### 9.3 What conversion actually does (and why it's costly)
 
@@ -499,8 +562,15 @@ conventional fixed-size extent layout used by writable files (§5.3):
    served from the old chunk-log until the swap in step 5) and **remains
    append-writable at its old EOF** (new appends land as additional
    chunk-log records past the point already captured in step 3's
-   snapshot; the materializer picks them up in a final small delta pass)
-   — so a long-running append workload isn't blocked by a slow conversion.
+   snapshot; the materializer picks them up in delta passes) — so a
+   long-running append workload isn't blocked by a slow conversion.
+   Delta passes are **bounded**, or a sustained append workload livelocks
+   the conversion (each pass ends with new appends already outstanding):
+   after at most k passes (default 3), or earlier once a pass's remaining
+   delta is under a small threshold, the materializer briefly quiesces
+   appends — new appends block for the milliseconds it takes to copy the
+   final tail — then performs the swap and unblocks. Conversion therefore
+   always terminates, at the cost of one short, bounded append stall.
    Any attempt at a *random* write during `Converting` blocks (or returns
    `EAGAIN` in non-blocking mode) until the swap completes, since it's not
    yet safe to accept it.
@@ -676,3 +746,81 @@ and what's future work is explicit.
     and the kernel module's test suite, closing the gap flagged in §5.3
     (two independent implementations of the same record layout, not
     provably in agreement today beyond "both follow this document").
+
+## 16. Reviewed proposals (agreed direction, not yet scheduled)
+
+Design-review outcomes that change architecture rather than fix defects
+(defects found in the same review were fixed in place: the weighted-HRW
+bias in §7.2, fence durability ordering in §6, bounded conversion delta
+passes in §9.3, the ioctl ABI/permission rules in §9.2). Each of these is
+believed right but deliberately not yet folded into the main design text,
+because each changes something Phase 1 (§15) should validate first.
+
+### 16.1 Self-describing chunk-log; demote the chunk index to a rebuildable cache
+
+Today every append pays a synchronous 2-disk metadata WAL commit for its
+chunk pointer — two extra device flushes on the hottest path in the
+system. But each log record already carries `(inode, chunk_seq, len,
+checksum)` (§5.3): the segments themselves can be the authority, exactly
+as Bitcask treats its data files. The chunk-pointer list in the metadata
+store then becomes a lazily-maintained index, checkpointed periodically
+and rebuilt after a crash by scanning segment tails written since the
+last checkpoint. The synchronous 2-disk WAL shrinks to what actually
+needs it: namespace operations (create/rename/unlink), pool-map and
+meta-group changes, mode transitions — all rare. `fsync(fd)` on an
+append-only file then means "flush the file's outstanding segment
+records on all N replicas", with no metadata flush required for
+durability of data. This is the single biggest write-latency lever
+available and *simplifies* the recovery story (one authority instead of
+two that must agree). Cost: recovery-time tail scans, and the index must
+tolerate being stale — both well-trodden log-structured territory.
+
+### 16.2 Placement-group indirection
+
+HRW keyed per `(inode, chunk_seq)` with replica lists stored per chunk
+means a disk add/remove rewrites metadata for every moved chunk —
+O(moved chunks) metadata transactions of churn. Interposing a fixed set
+of placement groups (`PG = hash(inode, chunk_seq) mod 2^14`; a small
+`PG → [DiskId; N]` table as one metadata row) makes topology changes
+update table entries instead of per-chunk pointers, gives repair and
+scrub a natural whole-PG unit of work, and bounds what the rebalancer
+must track. This is Ceph's PG idea shrunk to single-host scale. It
+composes with 16.1 (records stay self-describing; only the *routing*
+gains a level of indirection) and partially supersedes per-chunk replica
+lists — which is exactly why it should land before any on-disk format is
+declared stable.
+
+### 16.3 Page-cache integration for reads
+
+The design currently routes all I/O through direct block access. Right
+for replication fan-out writes; wrong as the only read path — a kernel
+filesystem gets caching, readahead, and read-only `mmap` nearly free via
+`address_space_operations`, and append-only files are the best possible
+tenant for the page cache (immutable-once-written pages never need
+invalidating). Without this, cold small reads will benchmark
+embarrassingly against ext4 and `grep`/`mmap`-heavy workloads won't work
+at all. Plan: reads through the page cache in both file modes;
+`O_DIRECT` honored when requested; replication writes keep the direct
+path.
+
+### 16.4 Crash-consistency contract and mechanical crash testing
+
+Write down what `fsync`, `O_SYNC`, and `close` promise per file mode
+(with 16.1: data durability = segment records flushed on all N replicas;
+namespace durability = WAL commit), then enforce it mechanically rather
+than by review: `dm-log-writes` replay to test every write-boundary
+crash point, `dm-flakey` for fault injection during degraded/fence
+transitions (§6's ordering rules are exactly the kind of thing only this
+style of testing catches), and xfstests wired up as soon as the FUSE
+prototype can mount — the generic suite finds VFS-contract violations
+that unit tests structurally cannot.
+
+### 16.5 Snapshots for append-only files
+
+With immutable chunk-log records (and especially with 16.1), a snapshot
+of an append-only file is a copy of its pointer list plus a refcount on
+the records — no data copy, no CoW machinery beyond what the compactor
+already respects. Writable files would need real CoW extents and are
+explicitly *not* included. Worth doing early only because it's nearly
+free on this layout and pins down record-refcounting semantics the
+compactor needs anyway; otherwise it stays future work.

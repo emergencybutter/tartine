@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/uuid.h>
+#include <linux/build_bug.h>
 
 #define TARTINE_SB_MAGIC_STR "TARTINE1"
 #define TARTINE_SB_MAGIC_LEN 8
@@ -76,9 +77,16 @@ static inline struct tartine_inode_info *TARTINE_I(struct inode *inode)
 
 struct tartine_state {
 	__u32 mode;
+	/* Explicit padding: without it, 64-bit builds insert 4 invisible
+	 * bytes here and 32-bit builds don't, so sizeof — and therefore the
+	 * _IOR command number — would differ between 32- and 64-bit
+	 * userspace. Always 0. Mirrored in tartine-fuse/src/ioctl.rs. */
+	__u32 _pad;
 	__u64 bytes_total;
 	__u64 bytes_converted;
 };
+
+static_assert(sizeof(struct tartine_state) == 24);
 
 /*
  * Control device (`/dev/tartine-ctl`) ioctls, used before any pool disk

@@ -120,7 +120,9 @@ pub struct ChunkPointer {
     pub chunk_seq: u64,
     pub replicas: Vec<DiskId>,
     pub len: u32,
-    pub checksum: u64,
+    /// crc32c of the payload (DESIGN.md §4.1/§5.3 — the kernel's own
+    /// hardware-accelerated crc32c(), so 32 bits, not a 64-bit hash).
+    pub checksum: u32,
 }
 
 /// One entry in a writable file's extent map: a fixed-size, block-aligned
@@ -130,7 +132,8 @@ pub struct Extent {
     pub file_offset: u64,
     pub len: u32,
     pub replicas: Vec<DiskId>,
-    pub checksum: u64,
+    /// crc32c of the extent contents (same scheme as `ChunkPointer`).
+    pub checksum: u32,
 }
 
 #[derive(Debug, Clone)]

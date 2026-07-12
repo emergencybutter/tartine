@@ -19,7 +19,8 @@ pub struct SegmentHeader {
 pub struct Record {
     pub inode: InodeId,
     pub chunk_seq: u64,
-    pub checksum: u64,
+    /// crc32c of `payload` (DESIGN.md §5.3).
+    pub checksum: u32,
     pub payload: Vec<u8>,
 }
 
@@ -68,12 +69,12 @@ impl<D: crate::disk::Disk> SegmentWriter<D> {
     }
 }
 
-/// Minimal length-prefixed encoding: `inode(8) chunk_seq(8) checksum(8)
+/// Minimal length-prefixed encoding: `inode(8) chunk_seq(8) checksum(4)
 /// len(4) payload(len)`. A real implementation would use `bincode`/`serde`
 /// (see the workspace `Cargo.toml` comment) — spelled out by hand here so
 /// this crate has zero external dependencies.
 fn encode(record: &Record) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(28 + record.payload.len());
+    let mut buf = Vec::with_capacity(24 + record.payload.len());
     buf.extend_from_slice(&record.inode.to_le_bytes());
     buf.extend_from_slice(&record.chunk_seq.to_le_bytes());
     buf.extend_from_slice(&record.checksum.to_le_bytes());
