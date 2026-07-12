@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tartine-proto",
+    "crates/tartine-core",
+    "crates/tartine-meta",
+    "crates/tartine-fuse",
+    "crates/tartined",
+    "crates/tartinectl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Real dependencies a full implementation would pull in (kept out of this
+# skeleton so it builds offline with the standard library only — see
+# DESIGN.md for the rationale behind each choice):
+#
+#   fuser   = "0.14"   # FUSE session (crates/tartine-fuse)
+#   io-uring = "0.6"   # async disk I/O (crates/tartine-core)
+#   redb    = "2"      # embedded metadata KV store (crates/tartine-meta)
+#   blake3  = "1"      # chunk/extent checksums (crates/tartine-core)
+#   serde / bincode    # on-disk record (de)serialization
+#   tonic / prost      # control-plane gRPC (tartined <-> tartinectl)
+#   tokio              # async runtime

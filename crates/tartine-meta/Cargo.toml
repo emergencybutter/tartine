@@ -1,0 +1,9 @@
+[package]
+name = "tartine-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tartine-proto = { path = "../tartine-proto" }
+tartine-core = { path = "../tartine-core" }

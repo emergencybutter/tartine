@@ -1,0 +1,18 @@
+[package]
+name = "tartined"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tartined"
+path = "src/main.rs"
+
+[dependencies]
+tartine-proto = { path = "../tartine-proto" }
+tartine-core = { path = "../tartine-core" }
+tartine-meta = { path = "../tartine-meta" }
+tartine-fuse = { path = "../tartine-fuse" }
+
+# tokio, tonic, fuser would wire the pieces below into a real event loop
+# and control-plane RPC server (see DESIGN.md §3, §4).
