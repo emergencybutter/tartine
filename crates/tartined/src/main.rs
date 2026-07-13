@@ -5,8 +5,15 @@
 //! actual production target — see DESIGN.md's opening note and §3/§4).
 //!
 //! ```text
-//! tartined --disk a.img[:hdd|ssd|nvme] --disk b.img [...] [--redb path] <mountpoint>
+//! tartined --disk a.img[:hdd|ssd|nvme] [--disk b.img ...] [--redb path] <mountpoint>
 //! ```
+//!
+//! At least 1 `--disk` is required; 2 or more get real 2-disk metadata
+//! replication (DESIGN.md §6). With exactly 1, the pool runs with a
+//! replication factor of 1 — the same disk holds both the metadata WAL
+//! and file data, and both metadata and default per-file redundancy
+//! degrade accordingly (DESIGN.md §6's `min(2, disk count)` rule; see
+//! `tartine_meta::pool`'s module doc comment).
 //!
 //! If every `--disk` path already exists, the pool is reopened
 //! (`Pool::open_with_classes`, replaying the WAL and recovery-scanning
@@ -74,10 +81,18 @@ fn main() {
         i += 1;
     }
 
-    let (Some(mountpoint), false) = (mountpoint, disks.len() < 2) else {
+    let (Some(mountpoint), false) = (mountpoint, disks.is_empty()) else {
         usage();
     };
     let redb_path = redb_path.unwrap_or_else(|| disks[0].with_extension("redb"));
+
+    if disks.len() == 1 {
+        eprintln!(
+            "tartined: single-disk mode — metadata has no replica and files default to \
+             unreplicated storage (DESIGN.md §6's min(2, disk count) replication factor); \
+             add a second --disk for real redundancy"
+        );
+    }
 
     let all_exist = disks.iter().all(|p| p.exists());
     let pool = if all_exist {
@@ -113,7 +128,9 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tartined --disk <path>[:hdd|ssd|nvme] --disk <path>[:class] [--disk ... ] [--redb <path>] <mountpoint>");
-    eprintln!("  (at least 2 --disk paths required; the first two form the metadata group)");
+    eprintln!("usage: tartined --disk <path>[:hdd|ssd|nvme] [--disk <path>[:class] ...] [--redb <path>] <mountpoint>");
+    eprintln!(
+        "  (at least 1 --disk path required; the first two, if present, form the metadata group)"
+    );
     std::process::exit(2);
 }

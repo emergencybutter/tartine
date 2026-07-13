@@ -62,7 +62,7 @@ cargo build --release -p tartine-kcore --features freestanding  # no_std smoke b
 make -C kernel                                       # kernel module (unverified — see kernel/README.md)
 ```
 
-`cargo test --workspace` runs 67 tests across `tartine-core`,
+`cargo test --workspace` runs 70 tests across `tartine-core`,
 `tartine-meta`, `tartine-kcore`, and `tartine-fuse`, covering crash
 recovery (truncated segment/WAL records), 2-disk metadata replication
 with fault-injected backup failure, and full append/convert/random-write
@@ -82,3 +82,8 @@ the exact transcript this has been run against, live, in this repo's
 sandbox. See `IMPLEMENTATION_PLAN.md`'s "Current status" section for
 what's still a stub (rebalancer, disk add/remove, persisted superblock,
 sub-block random writes) versus what's real.
+
+A single `--disk` also works: `tartined --disk solo.img /mnt/t1` mounts
+a pool where metadata and file data share that one disk, with the
+metadata and default per-file replication factor both degrading to 1
+(DESIGN.md §6's `min(2, disk count)` rule) instead of being rejected.

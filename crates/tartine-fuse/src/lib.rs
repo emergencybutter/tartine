@@ -47,9 +47,16 @@ pub fn get_state(inode: &InodeRecord) -> TartineState {
 
 /// The default redundancy policy for newly created files
 /// (`tartinectl fs set-default-redundancy`, DESIGN.md §10.3, isn't
-/// wired up in this prototype) — two unconstrained replicas.
-fn default_redundancy() -> RedundancyScheme {
-    RedundancyScheme::Replicated(vec![ReplicaSlot::AnyOfClass(None); 2])
+/// wired up in this prototype) — two unconstrained replicas, scaled
+/// down to whatever the pool can actually satisfy (same `min(2, disk
+/// count)` rule `Pool::format` already applies to the root inode —
+/// DESIGN.md §6) so file creation on a small pool doesn't hand every
+/// new file a redundancy policy its first write can never place.
+fn default_redundancy(disk_count: usize) -> RedundancyScheme {
+    RedundancyScheme::Replicated(vec![
+        ReplicaSlot::AnyOfClass(None);
+        2.min(disk_count.max(1))
+    ])
 }
 
 fn errno_for(e: &PoolError) -> Errno {
@@ -57,7 +64,7 @@ fn errno_for(e: &PoolError) -> Errno {
         PoolError::NotFound => Errno::ENOENT,
         PoolError::WrongMode => Errno::EPERM,
         PoolError::Unplaceable => Errno::ENOSPC,
-        PoolError::NeedAtLeastTwoDisks => Errno::EINVAL,
+        PoolError::NoDisks => Errno::EINVAL,
         PoolError::Io(_) | PoolError::Meta(_) => Errno::EIO,
     }
 }
@@ -206,14 +213,8 @@ impl Filesystem for TartineFs {
             return;
         }
         let unix_mode = S_IFREG | (mode & 0o7777);
-        match pool.create_file(
-            parent.0,
-            name,
-            default_redundancy(),
-            req.uid(),
-            req.gid(),
-            unix_mode,
-        ) {
+        let redundancy = default_redundancy(pool.disk_count());
+        match pool.create_file(parent.0, name, redundancy, req.uid(), req.gid(), unix_mode) {
             Ok(inode) => match pool.get_inode(inode) {
                 Ok(Some(rec)) => reply.created(
                     &TTL,

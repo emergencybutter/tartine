@@ -619,6 +619,40 @@ mod tests {
         }
     }
 
+    /// A pool formed with only 1 disk (DESIGN.md §6's `min(2, disk
+    /// count)` replication factor) constructs `MetaStore` with
+    /// `backup: None` from the very first `open` call, not just after
+    /// runtime fencing (that path is `backup_failure_fences_but_keeps_serving_degraded`
+    /// below) — this is the state a single-disk pool lives in
+    /// permanently.
+    #[test]
+    fn opens_and_commits_with_no_backup_from_the_start() {
+        let (p, _b, r) = open_pair("nobackup");
+        for path in [&p, &r] {
+            let _ = std::fs::remove_file(path);
+        }
+        let primary = FileDisk::create(&p, wal::WAL_CAPACITY_BYTES).unwrap();
+        let group = MetaGroup {
+            primary: Uuid(1),
+            backup: None,
+            epoch: 0,
+        };
+
+        let mut store = MetaStore::open(group, primary, None, &r).unwrap();
+        assert!(store.group().backup.is_none());
+        store.apply(MetaOp::CreateInode(root_record())).unwrap();
+        assert!(store.get_inode(1).unwrap().is_some());
+
+        // Must survive a reopen from just the one disk too.
+        let primary2 = FileDisk::open(&p).unwrap();
+        let store2 = MetaStore::open(group, primary2, None, &r).unwrap();
+        assert!(store2.get_inode(1).unwrap().is_some());
+
+        for path in [&p, &r] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn backup_failure_fences_but_keeps_serving_degraded() {
         let (p, b, r) = open_pair("fence");

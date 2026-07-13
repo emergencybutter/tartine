@@ -18,8 +18,13 @@
 //! ```
 //!
 //! The first two disks passed to `format`/`open` become the metadata
-//! group; every disk gets the data role. Real superblock-based role/ID
-//! discovery is P1.7/kernel-side work (DESIGN.md §7), out of scope here.
+//! group (just the first, if there is no second — DESIGN.md §6's
+//! metadata replication factor is `min(2, disk count)`, so a 1-disk
+//! pool runs with a single, unreplicated metadata copy rather than
+//! being rejected); every disk gets the data role, so on a 1-disk pool
+//! that one disk necessarily holds both the metadata WAL and file
+//! data. Real superblock-based role/ID discovery is P1.7/kernel-side
+//! work (DESIGN.md §7), out of scope here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,7 +74,7 @@ pub enum PoolError {
     /// The operation requires the file to be `AppendOnly`/`Converting`
     /// (append) or `Writable` (random write) and it wasn't.
     WrongMode,
-    NeedAtLeastTwoDisks,
+    NoDisks,
 }
 
 impl std::fmt::Display for PoolError {
@@ -80,9 +85,7 @@ impl std::fmt::Display for PoolError {
             PoolError::Unplaceable => write!(f, "could not place all required replicas"),
             PoolError::NotFound => write!(f, "no such inode"),
             PoolError::WrongMode => write!(f, "operation not valid for this file's current mode"),
-            PoolError::NeedAtLeastTwoDisks => {
-                write!(f, "a pool needs at least 2 disks (for the metadata group)")
-            }
+            PoolError::NoDisks => write!(f, "a pool needs at least 1 disk"),
         }
     }
 }
@@ -143,15 +146,19 @@ impl Pool {
 
     /// Creates a brand-new pool: formats every disk file (tagged with
     /// the given `classes`, parallel to `disk_paths`), brings up the
-    /// metadata group on the first two, and creates the root directory
-    /// inode as the WAL's first entry.
+    /// metadata group on the first two (or just the first, if there is
+    /// no second — see DESIGN.md §6's single-disk note: the metadata
+    /// replication factor is `min(2, disk count)`, so a 1-disk pool
+    /// starts in the same primary-only state §6 already describes for
+    /// backup failure), and creates the root directory inode as the
+    /// WAL's first entry.
     pub fn format_with_classes(
         disk_paths: &[PathBuf],
         classes: &[DiskClass],
         redb_path: &Path,
     ) -> Result<Self, PoolError> {
-        if disk_paths.len() < 2 {
-            return Err(PoolError::NeedAtLeastTwoDisks);
+        if disk_paths.is_empty() {
+            return Err(PoolError::NoDisks);
         }
         assert_eq!(disk_paths.len(), classes.len(), "one class per disk path");
         let ids = Self::disk_ids_for(disk_paths);
@@ -190,10 +197,11 @@ impl Pool {
 
         let group = MetaGroup {
             primary: ids[0],
-            backup: Some(ids[1]),
+            backup: ids.get(1).copied(),
             epoch: 0,
         };
-        let mut meta = MetaStore::open(group, arcs[0].clone(), Some(arcs[1].clone()), redb_path)?;
+        let backup_arc = ids.get(1).map(|_| arcs[1].clone());
+        let mut meta = MetaStore::open(group, arcs[0].clone(), backup_arc, redb_path)?;
 
         let root =
             InodeRecord {
@@ -240,8 +248,8 @@ impl Pool {
         classes: &[DiskClass],
         redb_path: &Path,
     ) -> Result<Self, PoolError> {
-        if disk_paths.len() < 2 {
-            return Err(PoolError::NeedAtLeastTwoDisks);
+        if disk_paths.is_empty() {
+            return Err(PoolError::NoDisks);
         }
         assert_eq!(disk_paths.len(), classes.len(), "one class per disk path");
         let ids = Self::disk_ids_for(disk_paths);
@@ -281,16 +289,26 @@ impl Pool {
 
         let group = MetaGroup {
             primary: ids[0],
-            backup: Some(ids[1]),
+            backup: ids.get(1).copied(),
             epoch: 0,
         };
-        let meta = MetaStore::open(group, arcs[0].clone(), Some(arcs[1].clone()), redb_path)?;
+        let backup_arc = ids.get(1).map(|_| arcs[1].clone());
+        let meta = MetaStore::open(group, arcs[0].clone(), backup_arc, redb_path)?;
 
         Ok(Pool {
             pool_map,
             disks,
             meta,
         })
+    }
+
+    /// Number of disks in the pool — used to scale default per-file
+    /// redundancy the same way the root inode's is scaled (see
+    /// `format_with_classes`): a small pool can't satisfy a 2-replica
+    /// scheme, so callers should ask for `2.min(disk_count())` instead
+    /// of a hardcoded 2.
+    pub fn disk_count(&self) -> usize {
+        self.disks.len()
     }
 
     pub fn alloc_inode(&mut self) -> InodeId {
@@ -748,6 +766,49 @@ mod tests {
                 .unwrap();
             assert_eq!(buf, b"triplicated");
         }
+    }
+
+    #[test]
+    fn format_rejects_zero_disks() {
+        let t = TestPaths::new("zerodisks", 0);
+        assert!(matches!(
+            Pool::format(&t.disks, &t.redb),
+            Err(PoolError::NoDisks)
+        ));
+    }
+
+    /// A single physical disk holding both the metadata WAL and file
+    /// data (DESIGN.md §6's `min(2, disk count)` replication factor):
+    /// the same create/append/read/convert/random-write shape as
+    /// `convert_then_random_write_round_trips`, but on exactly 1 disk
+    /// with a 1-replica scheme, since a 2-replica scheme can never be
+    /// satisfied here.
+    #[test]
+    fn format_and_use_single_disk_pool() {
+        let t = TestPaths::new("single", 1);
+        let mut pool = Pool::format(&t.disks, &t.redb).unwrap();
+        assert_eq!(pool.disk_count(), 1);
+
+        // The root inode's own redundancy must already have scaled
+        // down to 1 slot rather than being stuck asking for 2.
+        let root = pool.get_inode(ROOT_INODE).unwrap().unwrap();
+        match root.redundancy {
+            RedundancyScheme::Replicated(slots) => assert_eq!(slots.len(), 1),
+            other => panic!("expected Replicated, got {other:?}"),
+        }
+
+        let inode = pool
+            .create_file(ROOT_INODE, "f", any_n(1), 0, 0, 0o644)
+            .unwrap();
+        pool.append(inode, b"hello\n".to_vec()).unwrap();
+        assert_eq!(pool.read(inode, 0, 100).unwrap(), b"hello\n");
+
+        pool.begin_convert(inode).unwrap();
+        pool.complete_convert(inode).unwrap();
+        assert_eq!(pool.read(inode, 0, 100).unwrap(), b"hello\n");
+
+        pool.write(inode, 2, b"L").unwrap();
+        assert_eq!(pool.read(inode, 0, 100).unwrap(), b"heLlo\n");
     }
 
     #[test]

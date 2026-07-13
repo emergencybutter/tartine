@@ -19,7 +19,7 @@ possible rather than after Phase 1 is "done."
 ## 0. Current status (accurate as of this update, not aspirational)
 
 **P1.1–P1.6 are done** — real, tested, and verified against a live mount
-(67 workspace tests, `cargo test --workspace` green,
+(70 workspace tests, `cargo test --workspace` green,
 `cargo build --release -p tartine-kcore --features freestanding` clean).
 `tartined --disk a.img:hdd --disk b.img:hdd --disk c.img:ssd /mnt/t`
 mounts a real filesystem; the exact shell transcript in §P1.5 below has
@@ -29,6 +29,15 @@ truncate-write is rejected with `EPERM`, `tartinectl file set-redundancy
 <path> hdd,ssd` + `convert --wait` (both real `ioctl(2)` calls) work, and
 the post-conversion in-place `dd` write works. See §P1.1–§P1.6 below for
 what each milestone actually built; this section only summarizes.
+
+**Single-disk pools are also supported and live-verified**: `Pool::format`/
+`open` now accept exactly 1 disk (previously a hard `NeedAtLeastTwoDisks`
+rejection). Metadata replication and default per-file redundancy both
+degrade to `min(2, disk count)` (DESIGN.md §6's single-disk note) rather
+than being stuck asking for 2 replicas a 1-disk pool can never place —
+`tartined --disk solo.img /mnt/t1` mounts and the same append/read/
+set-redundancy/`convert --wait`/random-write shape works with metadata
+and file data genuinely sharing the one backing file.
 
 **Real and tested**:
 

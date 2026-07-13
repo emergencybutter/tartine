@@ -344,6 +344,18 @@ worth noting): shard the namespace by directory hash into N independent
 shard; only the routing (`shard = hash(parent_inode) % N`) is added. v1
 ships with N=1 since "2 disks" was specified as a pool-wide property.
 
+**Single-disk pools**: the metadata replication factor is really
+`min(2, disks in the pool)`, not a hard floor of exactly 2. A pool
+formed with only 1 disk starts in the same primary-only state described
+above for backup failure — one durable metadata copy, `MetaGroup.backup
+= None` — except entered intentionally at format time instead of
+reached via failure + fencing. That one disk necessarily holds both the
+metadata role and the data role (§5.1 already allows a disk to hold
+both). The moment a second disk joins the pool, the existing *planned
+migration* path above applies unchanged: add it as the backup, let it
+catch up via full copy + WAL replay, then bump the epoch — there is no
+separate "graduate out of single-disk mode" mechanism to build.
+
 ## 7. Pool management & placement
 
 ### 7.1 Pool map
