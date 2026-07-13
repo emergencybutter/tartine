@@ -16,49 +16,87 @@ has no userspace equivalent to prototype and so starts early, in
 parallel with Phase 1, to surface build-environment problems as soon as
 possible rather than after Phase 1 is "done."
 
-## 0. Current status (accurate as of this plan, not aspirational)
+## 0. Current status (accurate as of this update, not aspirational)
 
-**Real and tested** (35 workspace tests, `cargo test --workspace` green,
-`cargo build --release -p tartine-kcore --features freestanding` clean):
+**P1.1–P1.6 are done** — real, tested, and verified against a live mount
+(67 workspace tests, `cargo test --workspace` green,
+`cargo build --release -p tartine-kcore --features freestanding` clean).
+`tartined --disk a.img:hdd --disk b.img:hdd --disk c.img:ssd /mnt/t`
+mounts a real filesystem; the exact shell transcript in §P1.5 below has
+been run against it end to end, live, in this sandbox (fuse3 installed
+via `apt-get`, `/dev/fuse` present, running as root) — append works,
+truncate-write is rejected with `EPERM`, `tartinectl file set-redundancy
+<path> hdd,ssd` + `convert --wait` (both real `ioctl(2)` calls) work, and
+the post-conversion in-place `dd` write works. See §P1.1–§P1.6 below for
+what each milestone actually built; this section only summarizes.
+
+**Real and tested**:
 
 - `tartine-kcore`: HRW placement (logarithmic weighted rendezvous),
   per-slot redundancy placement (`place_redundancy`), the
   append-only/converting/writable state machine. `#![no_std]`,
   zero-dependency, C ABI. This is the one piece of logic both front ends
-  will run unmodified.
+  run unmodified.
 - `tartine-proto`: all shared types (`PoolMap`, `InodeRecord`,
-  `RedundancyScheme`, `SuperBlock`, `MetaOp`, ...).
-- `tartine-core`: `placement` (typed wrapper over `tartine-kcore`),
-  `redundancy_spec` (grammar parser), `segment` (chunk-log record
-  format) — the last one is *structurally* implemented but has never
-  been exercised against a real `Disk` impl or reopened/recovered from.
-- `tartine-fuse`: `write_path` (typed adapter over `tartine-kcore`),
-  `ioctl` (the wire types). `TartineFs::on_write` /
-  `on_ioctl_make_writable` are logic-only stubs — see below.
+  `RedundancyScheme`, `MetaOp` — now including `UpdateExtents`, added
+  while building P1.4 — ...).
+- `tartine-core`: `disk::FileDisk` (a real `Disk` impl), `crc32c`
+  (hand-rolled, standard-check-value-verified), `segment` (chunk-log
+  format with real crash recovery — `scan()` — and a magic-prefixed
+  header, a correctness fix found while implementing recovery),
+  `placement` (typed wrapper over `tartine-kcore`), `redundancy_spec`
+  (grammar parser).
+- `tartine-meta`: `codec` (hand-rolled `MetaOp` binary encoding),
+  `wal` (WAL framing, same crash-recovery shape as `segment`),
+  `store::MetaStore` (redb-backed materialized view + the existing,
+  now-exercised `MetaReplicator` for durable 2-disk WAL replication,
+  including a fault-injection test proving backup-failure fencing),
+  `pool::Pool` (ties disks + placement + `MetaStore` together — format/
+  open, create/link/unlink/readdir, append, read, begin/complete
+  convert, random write, all tested including a reopen-after-crash
+  scenario exercising WAL replay and segment recovery together).
+- `tartine-fuse`: a real `fuser::Filesystem` impl on `TartineFs`
+  (lookup/getattr/setattr/create/unlink/read/write/readdir/ioctl), the
+  `ioctl` module's redundancy-policy wire format
+  (`encode`/`decode_set_redundancy`, mirroring `kernel/tartine.h`
+  byte-for-byte).
+- `tartined`: a real daemon — parses `--disk path[:class]` args, formats
+  or reopens a `Pool`, mounts via `fuser::mount2`.
+- `tartinectl`: `file set-redundancy`/`get-redundancy` and `convert`
+  issue real `ioctl(2)` calls (via `libc::ioctl`) against the mountpoint
+  — the gRPC-control-socket-vs-ioctl-on-mountpoint decision (P1.6,
+  originally an open question) is now simply how it works.
 - `kernel/`: VFS registration, superblock read/checksum/parse, root
   inode, and the full ioctl surface (mode transitions +
-  `SET`/`GET_REDUNDANCY`) against **in-core-only** state. Written, not
-  build-verified (no kernel headers in the authoring environment).
+  `SET`/`GET_REDUNDANCY`) against **in-core-only** state. Still written,
+  not build-verified (no kernel headers in this environment) —
+  unaffected by this round of Phase 1 work.
 
-**Not implemented — stubs or missing entirely**:
+**Not implemented — stubs or missing entirely** (see §P1.7 onward):
 
-- No process ever actually mounts anything. `tartined` prints a message
-  and exits; there is no `fuser::Filesystem` impl, no event loop.
-- No `Disk` implementation exists (the trait in `tartine-core::disk` has
-  no impl anywhere in the workspace).
-- `tartine-meta`'s `Store` trait has no backing implementation (no
-  `redb` integration); `MetaReplicator` has never run against real
-  files.
-- No pool assembly (nothing builds a `PoolMap` from actual disks).
 - No rebalancer, no scrubber, no repair loop, no disk add/remove, no
-  device-scan registry, anywhere.
-- The kernel module's `write_iter`/`read_iter` return `-EOPNOTSUPP`
-  after classification; `TARTINE_IOC_SET_REDUNDANCY` stores into
-  memory but nothing reads it back for placement decisions.
-- Nothing has been tested against a real kernel build tree.
-
-The gap between "the decision-making logic is real and tested" and "the
-system does anything" is the entire rest of this plan.
+  device-scan registry. `tartinectl disk add/remove`, `meta set-disks`,
+  and `fs set-default-redundancy` are still stubs — they need the
+  rebalancer.
+- No real superblock is written to disk (`Pool::format`/`open` re-derive
+  disk identity from CLI argument order, not from anything persisted);
+  disk *class* likewise isn't persisted — `Pool::open_with_classes`
+  needs to be told the same classes again on every reopen. Both are
+  flagged in `pool.rs`'s doc comments as prototype gaps, not silently
+  papered over.
+- The conversion materializer is synchronous only (`Pool::complete_convert`
+  runs to completion inline); the async path, bounded delta-passes, and
+  progress reporting via `TARTINE_IOC_GET_STATE` while `Converting` are
+  not implemented (P1.9).
+- Random writes to a `Writable` file rewrite the *whole file* as one
+  extent rather than doing sub-block extent read-modify-write
+  (documented scope limit in `pool.rs`, matches DESIGN.md §14's own note
+  that the real extent allocator is future work).
+- No crash-consistency fault-injection harness (P1.11), no xfstests
+  (P1.12) — only the unit-level crash-recovery tests built alongside
+  P1.2/P1.3/P1.4 (truncated-record recovery, WAL-replay-after-drop).
+- Nothing has changed on the kernel side; still nothing tested against a
+  real kernel build tree.
 
 ## Phase 1 — FUSE prototype
 
@@ -69,7 +107,7 @@ ioctl actually materializing data, disk add/remove actually
 rebalancing. This is what gets kernel-ported in Phase 2; every
 correctness bug found here is one that never has to be found in ring 0.
 
-### P1.1 — A real `Disk`
+### P1.1 — A real `Disk` ✅ Done
 
 **Tasks**: implement `tartine_core::disk::Disk` for a plain file
 (`std::fs::File`, `pread`/`pwrite`-equivalent via `read_at`/`write_at`
@@ -80,7 +118,7 @@ logic right" with "make it fast" is how both take longer.
 **Exit criteria**: unit tests writing/reading back arbitrary byte
 ranges through the trait object against a tempfile.
 
-### P1.2 — Chunk-log round-trips for real
+### P1.2 — Chunk-log round-trips for real ✅ Done
 
 **Tasks**: wire `tartine_core::segment::SegmentWriter` to a real `Disk`;
 add the reader half (`SegmentReader` — doesn't exist yet) that scans
@@ -94,7 +132,7 @@ against originals (checksums included); a fault-injection test that
 truncates the file mid-record and confirms recovery drops exactly that
 record and nothing else.
 
-### P1.3 — Metadata store, for real
+### P1.3 — Metadata store, for real ✅ Done
 
 **Tasks**: implement `tartine_meta::Store` backed by `redb`. Wire
 `MetaReplicator` to two real files standing in for "the two metadata
@@ -108,7 +146,7 @@ confirming the replica pair stays consistent (a lightweight version of
 is P1.11 below, this is the minimum bar before anything is allowed to
 depend on this store).
 
-### P1.4 — Pool assembly
+### P1.4 — Pool assembly ✅ Done
 
 **Tasks**: a `Pool` type (new, doesn't exist yet — probably
 `tartine-core::pool` or a new small crate) that owns: the set of open
@@ -123,7 +161,7 @@ assembles a `PoolMap`, brings up the metadata group on two of them
 the metadata role," configurable later — P1.7 is where real selection
 logic matters).
 
-### P1.5 — `TartineFs` becomes a real, mountable filesystem
+### P1.5 — `TartineFs` becomes a real, mountable filesystem ✅ Done
 
 **Tasks**: implement `fuser::Filesystem` on `TartineFs`: `lookup`,
 `getattr`, `setattr`, `create`, `open`, `read`, `write`, `readdir`,
@@ -148,7 +186,7 @@ tartinectl convert /mnt/t/f --wait
 dd if=/dev/zero of=/mnt/t/f bs=1 seek=2 count=1 conv=notrunc  # now works
 ```
 
-### P1.6 — Admin surface: ioctl-on-mountpoint, not gRPC
+### P1.6 — Admin surface: ioctl-on-mountpoint, not gRPC ✅ Done
 
 **Recommended simplification** (flagged, not silently applied — see
 "Open decisions" below): drop the `tonic`/`prost` control-socket

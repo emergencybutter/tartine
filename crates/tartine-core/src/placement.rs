@@ -26,11 +26,18 @@ pub fn placement_key(inode: u64, seq: u64) -> u64 {
     tartine_kcore::placement::tartine_hash_key(inode, seq)
 }
 
-fn disk_id_to_hi_lo(id: DiskId) -> (u64, u64) {
-    let bytes = id.0.to_be_bytes();
-    let hi = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let lo = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    (hi, lo)
+/// Splits a `DiskId`'s `u128` into the `(hi, lo)` pair every FFI struct
+/// that names a disk uses (`DiskCandidate`, `ReplicaSlotSpec`, and
+/// `tartine-fuse::ioctl`'s wire format for `TARTINE_IOC_SET_REDUNDANCY`)
+/// — `pub` so it's the one place this split is defined, not reimplemented
+/// per call site.
+pub fn disk_id_to_hi_lo(id: DiskId) -> (u64, u64) {
+    ((id.0 >> 64) as u64, id.0 as u64)
+}
+
+/// Inverse of `disk_id_to_hi_lo`.
+pub fn disk_id_from_hi_lo(hi: u64, lo: u64) -> DiskId {
+    tartine_proto::Uuid(((hi as u128) << 64) | lo as u128)
 }
 
 fn to_candidate(id: DiskId, entry: &DiskEntry) -> DiskCandidate {

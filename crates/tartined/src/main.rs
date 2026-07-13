@@ -1,24 +1,119 @@
-//! `tartined` — the FUSE **prototype's** daemon: mounts the namespace
-//! over FUSE, holds the metadata replicator, runs the rebalancer/scrubber,
-//! and serves the `tartinectl` control API. This exists to validate the
-//! design end-to-end in userspace before it's committed to kernel code
-//! (`kernel/`, the actual production target — see DESIGN.md's opening
-//! note and §3/§4). See DESIGN.md §3 for the overall wiring this `main`
-//! would perform in a real prototype build:
+//! `tartined` — the FUSE **prototype's** daemon (IMPLEMENTATION_PLAN.md
+//! P1.5): assembles a `Pool` from a set of disk-backing files and
+//! mounts it via `fuser`. This validates the design end-to-end in
+//! userspace before it's committed to kernel code (`kernel/`, the
+//! actual production target — see DESIGN.md's opening note and §3/§4).
 //!
-//!   1. Read every attached disk's superblock, union their cached
-//!      `MetaGroup`/`PoolMap` echoes, pick the highest-epoch answer.
-//!   2. Open the metadata store on the resulting primary (+ backup)
-//!      disk(s), replay the WAL since the last checkpoint.
-//!   3. Start the rebalancer, scrubber, and control-socket server as
-//!      background tasks.
-//!   4. Mount the FUSE session (`tartine_fuse::TartineFs`) and serve.
+//! ```text
+//! tartined --disk a.img[:hdd|ssd|nvme] --disk b.img [...] [--redb path] <mountpoint>
+//! ```
 //!
-//! Left as a stub: this binary's job is to prove the crates in this
-//! workspace fit together, not to duplicate `DESIGN.md`.
+//! If every `--disk` path already exists, the pool is reopened
+//! (`Pool::open_with_classes`, replaying the WAL and recovery-scanning
+//! each disk's segment region); otherwise it's freshly formatted
+//! (`Pool::format_with_classes`). The optional `:class` suffix is the
+//! manual-override half of DESIGN.md §10.1's disk-class story (real
+//! rotational-flag auto-detection isn't implemented); a disk with no
+//! suffix defaults to `hdd`.
+//!
+//! Not implemented (see IMPLEMENTATION_PLAN.md's remaining Phase 1
+//! milestones): the rebalancer, scrubber, and disk add/remove (P1.7),
+//! repair-on-corruption (P1.8), and the async/bounded-delta-pass
+//! materializer (P1.9) — `TARTINE_IOC_MAKE_WRITABLE` only supports the
+//! synchronous (`--wait`) path today.
+
+use std::path::PathBuf;
+
+use fuser::{Config, MountOption};
+use tartine_meta::pool::Pool;
+use tartine_proto::DiskClass;
+
+fn parse_class(s: &str) -> DiskClass {
+    match s {
+        "hdd" => DiskClass::Hdd,
+        "ssd" => DiskClass::Ssd,
+        "nvme" => DiskClass::Nvme,
+        other => {
+            eprintln!("tartined: unknown disk class {other:?} (expected hdd/ssd/nvme)");
+            std::process::exit(2);
+        }
+    }
+}
 
 fn main() {
-    eprintln!("tartined: FUSE prototype skeleton only, no pool implementation yet");
-    eprintln!("production target is the kernel module in kernel/ — see DESIGN.md");
-    std::process::exit(1);
+    let args: Vec<String> = std::env::args().collect();
+    let mut disks: Vec<PathBuf> = Vec::new();
+    let mut classes: Vec<DiskClass> = Vec::new();
+    let mut redb_path: Option<PathBuf> = None;
+    let mut mountpoint: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--disk" => {
+                i += 1;
+                let spec = args.get(i).map(String::as_str).unwrap_or_else(|| usage());
+                let (path, class) = match spec.split_once(':') {
+                    Some((p, c)) => (p, parse_class(c)),
+                    None => (spec, DiskClass::Hdd),
+                };
+                disks.push(PathBuf::from(path));
+                classes.push(class);
+            }
+            "--redb" => {
+                i += 1;
+                redb_path = Some(PathBuf::from(args.get(i).unwrap_or_else(|| usage())));
+            }
+            other => {
+                if mountpoint.is_some() {
+                    usage();
+                }
+                mountpoint = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+
+    let (Some(mountpoint), false) = (mountpoint, disks.len() < 2) else {
+        usage();
+    };
+    let redb_path = redb_path.unwrap_or_else(|| disks[0].with_extension("redb"));
+
+    let all_exist = disks.iter().all(|p| p.exists());
+    let pool = if all_exist {
+        eprintln!("tartined: reopening existing pool ({} disks)", disks.len());
+        Pool::open_with_classes(&disks, &classes, &redb_path)
+    } else {
+        eprintln!("tartined: formatting a new pool ({} disks)", disks.len());
+        Pool::format_with_classes(&disks, &classes, &redb_path)
+    };
+    let pool = match pool {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("tartined: failed to open pool: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let fs = tartine_fuse::TartineFs::new(pool);
+    // `Config` is `#[non_exhaustive]` (fuser reserves the right to add
+    // fields), so it's built via `default()` + field assignment rather
+    // than struct-literal syntax.
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("tartine".to_string()),
+        MountOption::Subtype("tartine".to_string()),
+    ];
+
+    eprintln!("tartined: mounting on {}", mountpoint.display());
+    if let Err(e) = fuser::mount2(fs, &mountpoint, &config) {
+        eprintln!("tartined: mount failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn usage() -> ! {
+    eprintln!("usage: tartined --disk <path>[:hdd|ssd|nvme] --disk <path>[:class] [--disk ... ] [--redb <path>] <mountpoint>");
+    eprintln!("  (at least 2 --disk paths required; the first two form the metadata group)");
+    std::process::exit(2);
 }

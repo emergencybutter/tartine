@@ -15,5 +15,10 @@ tartine-proto = { path = "../tartine-proto" }
 # the kernel module never has to parse this grammar over the structured
 # ioctl path (DESIGN.md §10).
 tartine-core = { path = "../tartine-core" }
+# tartine-fuse owns the ioctl wire format (numbers + wire structs) that
+# both the kernel module and the FUSE prototype implement identically
+# (IMPLEMENTATION_PLAN.md P1.6) — reused here rather than redefined.
+tartine-fuse = { path = "../tartine-fuse" }
+libc = "0.2"
 
-# clap + tonic (as a client of tartined's control socket) in a real build.
+# clap for a real build's argument parsing.

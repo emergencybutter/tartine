@@ -47,9 +47,11 @@ crates/               Rust workspace: one shared core, one prototype
                           in-kernel B-tree instead — see DESIGN.md §4)
   tartine-fuse            FUSE prototype: write-path adapter over
                           tartine-kcore, the ioctl surface
-  tartined                FUSE prototype daemon (skeleton only)
-  tartinectl              CLI — issues the same ioctls whether the mount
-                          is the kernel module or the FUSE prototype
+  tartined                FUSE prototype daemon — assembles a Pool from
+                          disk-backing files and mounts it via `fuser`
+  tartinectl              CLI — issues real ioctl(2) calls, the same
+                          wire format whether the mount is the kernel
+                          module or the FUSE prototype
 ```
 
 ## Building
@@ -60,8 +62,23 @@ cargo build --release -p tartine-kcore --features freestanding  # no_std smoke b
 make -C kernel                                       # kernel module (unverified — see kernel/README.md)
 ```
 
-The Rust workspace builds and tests clean with no external crates (see
-the comment block in the root `Cargo.toml` for what a fuller prototype
-build would add: `fuser`, `redb`, `tonic`, ...). `tartined`/`tartinectl`
-in the FUSE prototype still just print what they'd do — there's no
-working FUSE mount yet, only the tested logic underneath one.
+`cargo test --workspace` runs 67 tests across `tartine-core`,
+`tartine-meta`, `tartine-kcore`, and `tartine-fuse`, covering crash
+recovery (truncated segment/WAL records), 2-disk metadata replication
+with fault-injected backup failure, and full append/convert/random-write
+round trips through `Pool`. The FUSE prototype is a real, mountable
+filesystem:
+
+```sh
+tartined --disk a.img:hdd --disk b.img:hdd --disk c.img:ssd /mnt/t
+```
+
+mounts append-only-by-default files with per-file redundancy policy
+(`tartinectl file set-redundancy <path> <spec>`), truncate rejection,
+and the append→writable conversion ioctl
+(`tartinectl convert <path> --wait`), all backed by real disk I/O and
+2-disk metadata replication — see `IMPLEMENTATION_PLAN.md`'s §P1.5 for
+the exact transcript this has been run against, live, in this repo's
+sandbox. See `IMPLEMENTATION_PLAN.md`'s "Current status" section for
+what's still a stub (rebalancer, disk add/remove, persisted superblock,
+sub-block random writes) versus what's real.

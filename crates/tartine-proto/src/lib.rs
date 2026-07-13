@@ -139,11 +139,20 @@ pub enum InodeMode {
 }
 
 /// One entry in an append-only file's chunk-log pointer list: which
-/// sequence number, and which disks (in replica order) hold it.
+/// sequence number, and which disks hold it — each paired with the byte
+/// offset *on that disk's own segment region* where the record starts
+/// (DESIGN.md §5.3's `SegmentWriter::append` already returns this).
+/// Deliberately not a separate `replicas: Vec<DiskId>` + one shared
+/// `offset: u64` (an earlier version of this struct had that, found
+/// wrong while implementing the read path in `tartine-meta::pool`):
+/// each disk's segment region is independently bump-allocated —
+/// interleaved with every *other* file's chunks too — so there's no
+/// guarantee a chunk's replicas land at the same physical offset on
+/// every disk, even though they hold identical bytes.
 #[derive(Debug, Clone)]
 pub struct ChunkPointer {
     pub chunk_seq: u64,
-    pub replicas: Vec<DiskId>,
+    pub replicas: Vec<(DiskId, u64)>,
     pub len: u32,
     /// crc32c of the payload (DESIGN.md §4.1/§5.3 — the kernel's own
     /// hardware-accelerated crc32c(), so 32 bits, not a 64-bit hash).
@@ -151,12 +160,14 @@ pub struct ChunkPointer {
 }
 
 /// One entry in a writable file's extent map: a fixed-size, block-aligned
-/// range and the disks holding it.
+/// range and the disks holding it, each paired with the byte offset on
+/// that disk's own data region — same per-disk-offset reasoning as
+/// `ChunkPointer`.
 #[derive(Debug, Clone)]
 pub struct Extent {
     pub file_offset: u64,
     pub len: u32,
-    pub replicas: Vec<DiskId>,
+    pub replicas: Vec<(DiskId, u64)>,
     /// crc32c of the extent contents (same scheme as `ChunkPointer`).
     pub checksum: u32,
 }
@@ -249,6 +260,18 @@ pub enum MetaOp {
         inode: InodeId,
     },
     CompleteConvert {
+        inode: InodeId,
+        extents: Vec<Extent>,
+    },
+    /// Updates a **already-`Writable`** file's extent map after a
+    /// subsequent random write (DESIGN.md §11: "extent map update is
+    /// only a metadata txn when it *changes* the map"). Distinct from
+    /// `CompleteConvert`, which is the one-way `Converting -> Writable`
+    /// transition itself — `tartine_kcore::write_path::tartine_complete_convert`
+    /// deliberately rejects being called on a file that's already
+    /// `Writable`, so a second, different op is needed for this case
+    /// rather than reusing that one.
+    UpdateExtents {
         inode: InodeId,
         extents: Vec<Extent>,
     },

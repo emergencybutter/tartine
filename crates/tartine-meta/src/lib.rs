@@ -2,28 +2,26 @@
 //! tree, and the synchronous 2-disk WAL that replicates every mutation
 //! before it is acknowledged. See DESIGN.md §6.
 //!
-//! The store itself (`Store` trait) is left abstract; the prototype backs
-//! it with `redb` (a pure-Rust, transactional, file-backed B-tree — see
-//! the workspace `Cargo.toml` comment). What's implemented concretely
-//! here is the replication *protocol* around it, since that's the part
-//! specific to this design rather than off-the-shelf. Production
+//! `store::MetaStore` is the concrete, real implementation
+//! (IMPLEMENTATION_PLAN.md P1.3): `redb` (a pure-Rust, transactional,
+//! file-backed B-tree) as the local materialized-state cache, rebuilt by
+//! replaying the WAL this module's `MetaReplicator` durably writes to
+//! both metadata disks. `MetaReplicator` is the part specific to this
+//! design (the replication *protocol*) rather than off-the-shelf, so
+//! it's implemented directly against the `Disk` trait; production
 //! (`kernel/`) reuses this same protocol but against its own in-kernel
 //! on-disk B-tree instead of `redb` — see DESIGN.md §4.1, no userspace
 //! embedded KV engine is usable from kernel context.
 
+pub mod codec;
+pub mod pool;
+pub mod store;
+pub mod wal;
+
 use std::io;
 
 use tartine_core::disk::Disk;
-use tartine_proto::{DiskId, MetaGroup, MetaOp};
-
-/// The durable, ordered record of metadata mutations. `Store` is where a
-/// real implementation would plug in `redb` (or `sled`) as the underlying
-/// engine; this trait only asks for what the replication protocol below
-/// needs from it.
-pub trait Store {
-    fn append_wal(&mut self, op: &MetaOp) -> io::Result<u64 /* wal offset */>;
-    fn checkpoint(&mut self) -> io::Result<()>;
-}
+use tartine_proto::{DiskId, MetaGroup};
 
 /// Drives the synchronous primary/backup replication described in
 /// DESIGN.md §6: a `MetaOp` is not considered committed until it has been

@@ -3,6 +3,7 @@
 //! see `tartine-meta` and `tartine-fuse` for those layers. DESIGN.md is
 //! the source of truth this crate implements slices of.
 
+pub mod crc32c;
 pub mod disk;
 pub mod placement;
 pub mod redundancy_spec;

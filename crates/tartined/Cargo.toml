@@ -13,6 +13,9 @@ tartine-proto = { path = "../tartine-proto" }
 tartine-core = { path = "../tartine-core" }
 tartine-meta = { path = "../tartine-meta" }
 tartine-fuse = { path = "../tartine-fuse" }
+fuser = "0.17"
 
-# tokio, tonic, fuser would wire the pieces below into a real event loop
-# and control-plane RPC server (see DESIGN.md §3, §4).
+# tokio/tonic would be needed for a real background rebalancer/scrubber
+# and any future control-plane RPC — the FUSE prototype's admin surface
+# is ioctl-on-mountpoint instead (IMPLEMENTATION_PLAN.md P1.6), so
+# neither is needed for that. See DESIGN.md §3, §4.
