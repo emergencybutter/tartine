@@ -315,8 +315,12 @@ or automatic on failure):
   unrecoverable on-disk mistake): the fence record (new epoch + new
   membership) must be durable on the surviving metadata disk **and**
   acknowledged into the superblock echoes of a majority of the pool's
-  disks *before the first degraded-mode write is acknowledged to any
-  caller*. Without that ordering, a crash during degraded operation
+  remaining live disks — the same denominator the mount-time quorum
+  uses (see the hard-reboot note below), which is what keeps a 2-disk
+  pool workable: with the dead disk excluded, the survivor plus any
+  present data disks *can* form that majority — *before the first
+  degraded-mode write is acknowledged to any caller*. Without that
+  ordering, a crash during degraded operation
   followed by the *old* backup reappearing leaves two self-consistent
   metadata stores whose epochs can tie — metadata split-brain, with
   recovery unable to tell which side carries the post-fence writes. With
@@ -330,7 +334,9 @@ or automatic on failure):
   neither current metadata replica. Practically: each disk's superblock
   carries a cached copy of the last known `MetaGroup`; mount unions what
   it finds across all present disks (via the device-scan registry, §3)
-  and opens the highest-epoch answer confirmed by a majority of echoes.
+  and opens the highest-epoch answer confirmed by a majority of echoes
+  (majority of *what*, exactly, matters — see the hard-reboot note
+  below for the denominator).
   If the surviving evidence is **ambiguous** — e.g. both metadata disks
   claim the same epoch with different membership, or no majority of
   echoes agrees — mount *refuses* with a clear error rather than
@@ -365,38 +371,62 @@ enumerate on this boot. This is safe, for two independent reasons that
 both have to hold:
 
 1. **The surviving WAL is never internally wrong, only possibly short by
-   one op.** Step 3's rule — an op is acknowledged to the caller only
-   once it's durable on *every* disk in the group — means any op the
-   caller was told succeeded is, by construction, already present on
-   every disk that was a group member at ack time. A hard crash can only
-   ever leave the single most-recent, still-in-flight op inconsistent
-   across replicas (present on some, absent on others) — and since that
-   op was never acknowledged, no caller has any expectation it happened,
-   exactly matching the uncertainty an ordinary fsync-boundary crash
-   leaves on any single-disk log. Replaying whichever disk comes back
-   therefore always reconstructs a valid, causally-consistent state:
-   every acknowledged mutation is there, and at most one unacknowledged
-   one might quietly not be — never a corrupted or partially-applied
-   op, and never one replica silently missing something the other
-   replica's *acknowledged* history depends on.
+   an unacknowledged tail.** Step 3's rule — an op is acknowledged only
+   once it's durable on *every* group member — needs one ordering
+   refinement to make this hold under pipelining, and it's load-bearing
+   enough to state rather than assume: **acks are issued in WAL order,
+   and op *i* is acknowledged only once ops *1..i* are all durable on
+   every member** (plain group commit — not per-op independent acks
+   fired on I/O completion). Without that ordering, concurrent WAL
+   writes can complete out of order on one disk — op *i* durable, op
+   *i−1* still in flight — and acking *i* alone would let a crash leave
+   that disk's log with a hole *below* an acknowledged op; replay stops
+   at the hole (§12's power-loss row), so recovering from that disk
+   alone would silently drop an op the caller was told succeeded. With
+   the ordering, every disk's replayable WAL is by construction a
+   *prefix* of the single global op sequence, and every acknowledged op
+   lies inside every member's prefix. A hard crash therefore leaves
+   replicas differing only in their unacknowledged tails — ops no
+   caller has any expectation of, the same uncertainty an ordinary
+   fsync-boundary crash leaves on any single-disk log — and replaying
+   *whichever* disk comes back reconstructs a valid, causally-consistent
+   state containing every acknowledged mutation. (A torn final record is
+   caught by the WAL's checksum framing and treated as absent, never
+   half-applied.)
 2. **Trusting that survivor as authoritative still goes through the "On
    mount" quorum check above, not an assumption that "the disk that
    happened to boot must be right."** The surviving metadata disk's
    cached `MetaGroup`/epoch is corroborated against the bootstrap-pointer
-   echoes on every *other* present disk in the pool (data-role disks
-   included, per "On mount" above) before it's adopted — this is what
-   catches the case where the disk that rebooted successfully was
-   actually stale (e.g. it had already been fenced out and replaced
-   before the crash, and just hadn't been wiped yet, so its own on-disk
-   epoch looks perfectly self-consistent but is out of date). Only once
-   a majority of present disks corroborate its epoch does mount proceed
-   — serving immediately from that one surviving disk, in the same
-   primary-only degraded mode the live-failure path above already
-   describes, while provisioning and resyncing a replacement second disk
-   in the background. If the *other* disk later reappears carrying an
-   epoch that lost that vote, it's the stale side by definition and is
-   never silently trusted — reconciling it (if it has any tail worth
-   examining at all) requires an explicit `tartinectl pool adopt`.
+   echoes of the other present disks (data-role disks included, per "On
+   mount" above) before it's adopted — this is what catches the case
+   where the disk that rebooted successfully was actually stale (e.g. it
+   had already been fenced out and replaced before the crash, and just
+   hadn't been wiped yet, so its own on-disk epoch looks perfectly
+   self-consistent but is out of date).
+
+   The quorum denominator matters and is easy to get wrong: it is a
+   majority of the **live (non-`Dead`) membership named by the
+   highest-epoch candidate's own pool map** — *not* a majority of
+   whichever disks happen to be present at mount. "Majority of present"
+   is unsound: the stale fenced-out disk booting *alone* would be a
+   present-set of one, corroborate itself, and mount — precisely the
+   split-brain the fence exists to prevent. With the membership-based
+   denominator the asymmetry resolves correctly on its own: the stale
+   disk's pre-fence pool map still names the full pre-failure membership,
+   so booting alone it demands a quorum it cannot muster and mount
+   refuses (pending more disks or an explicit `tartinectl pool adopt`);
+   the genuine survivor's post-fence map has already shrunk (the fence
+   marked the dead disk `Dead` and reached a majority of superblock
+   echoes *before* any degraded write was acked — the fence durability
+   ordering above), so the survivor meets its own quorum from the disks
+   that are present and mounts, serving in the same primary-only
+   degraded mode as a live backup failure while a replacement resyncs in
+   the background. A tie between the two sides is impossible: fencing
+   always bumps the epoch. And if so few disks are present that even the
+   legitimate side can't reach its quorum, mount refuses rather than
+   guessing — a pool missing most of its disks can't serve data anyway,
+   and the operator override exists for exactly the "I know this is all
+   that's left" case.
 
 For a single-disk pool (previous bullet, N=1) this whole question is
 moot: there is only ever one metadata disk, so "does it come back" has a
@@ -552,10 +582,14 @@ accident of implementation order — losing the *second* metadata disk
 before a replacement finishes resyncing loses the entire namespace (§14's
 "one true single point of failure"), while data that's merely
 under-replicated (assuming its configured replication factor was ≥2 to
-begin with) is at elevated risk of loss, not yet lost. The scrubber/
-repair loop for the failed disk's data chunks still runs — it's queued
-behind metadata resync, not skipped — and picks up as soon as the
-health monitor has spare I/O priority to give it.
+begin with) is at elevated risk of loss, not yet lost. The ordering is
+strict, not just a priority hint: bulk data re-replication for the
+failed disk's chunks is queued behind the metadata resync and starts
+once the replacement backup has caught up — deferred, never skipped.
+The one exception is read-triggered repair (§8's repair-on-read): a
+chunk a caller is actively reading gets fixed opportunistically even
+mid-resync, because refusing to repair data in hand purely to preserve
+a queueing rule would protect nothing.
 
 ### 8.3 Total data loss: the `data_lost` inode flag
 
@@ -600,6 +634,15 @@ Setting `data_lost` puts the file into **read-only-metadata quarantine**:
   conventional filesystem reports for an unreadable sector, and `tartine`
   doesn't need a special vocabulary for "your data is unrecoverable" that
   application code wouldn't already know how to handle.
+- **`ftruncate` to zero is the in-place escape hatch**: it reads
+  nothing — it discards content wholesale — so it's permitted (on a
+  `Writable` file; §9.1's mode rules are checked first, so
+  `AppendOnly`/`Converting` files still get `EPERM` for any truncate,
+  quarantined or not). Once it commits, the file no longer *has* any
+  unrecoverable content, so the same metadata transaction **clears
+  `data_lost`**: a tool that wants to keep the inode itself — open fds,
+  hard links, ownership, xattrs — can `truncate` + rewrite in place
+  instead of `rm` + recreate.
 
 **Granularity is whole-file, not per-chunk/per-extent**, even though a
 file with `replication_factor > 1` could in principle lose only some of
@@ -894,8 +937,8 @@ extent map changed (new allocation, size growth), not per write.
 | Data disk disappears *and* also held a metadata replica (§5.1 — common on small pools, always true for a single-disk pool) | Same detection as both single-role rows, same event | Metadata resync (row below) is serviced first; the data repair above for that disk's chunks is queued behind it, not skipped (§8.2). |
 | Metadata disk disappears | I/O error on WAL write | Fence out of `MetaGroup`, `epoch += 1`, continue degraded (primary-only) while provisioning + resyncing a replacement (§6). |
 | Both metadata disks gone simultaneously | Mount fails | Manual recovery: operator points a mount attempt at any surviving data disks; namespace is unrecoverable beyond what can be reconstructed from data-disk superblocks' cached `MetaGroup`/pool-map echoes (best-effort) — this is the one true single point of failure in v1, called out explicitly in §14. |
-| Hard reboot; only one of the metadata group's disks comes back up | Mount-time device scan (§3) finds fewer than the full group | Bootstrap-pointer echoes from every present disk corroborate the survivor's cached epoch before it's trusted (§6, "On mount" / "Hard reboot with only one metadata disk surviving"); if a majority confirms, mount serves from that disk alone (same degraded, 1-copy mode as a live backup failure) while resyncing a replacement in the background; if ambiguous, mount refuses pending `tartinectl pool adopt`. |
-| A chunk/extent's last surviving replica is lost (a `replication_factor == 1` file's only disk dies, e.g. any file on a single-disk pool; or simultaneous loss exceeds a file's configured replication factor) | Repair loop finds zero surviving replicas for the chunk/extent | Inode's `data_lost` flag is set (§8.3); `read`/`write`/`TARTINE_IOC_MAKE_WRITABLE`/nonzero-`ftruncate` return `EIO`; `unlink`/`chmod`/`chown`/`stat` still work; logged for operator visibility instead of being retried forever. |
+| Hard reboot; only one of the metadata group's disks comes back up | Mount-time device scan (§3) finds fewer than the full group | The survivor's cached epoch must be corroborated by a majority of the live membership *its own pool map names* — not of whatever disks are present, which a lone stale disk would trivially satisfy (§6, "Hard reboot with only one metadata disk surviving"). If that quorum is met, mount serves from the one disk (same degraded, 1-copy mode as a live backup failure) while resyncing a replacement; if not, mount refuses pending more disks or `tartinectl pool adopt`. |
+| A chunk/extent's last surviving replica is lost (a `replication_factor == 1` file's only disk dies, e.g. any file on a single-disk pool; or simultaneous loss exceeds a file's configured replication factor) | Repair loop finds zero surviving replicas for the chunk/extent | Inode's `data_lost` flag is set (§8.3); `read`/`write`/`TARTINE_IOC_MAKE_WRITABLE`/nonzero-`ftruncate` return `EIO`; `unlink`/`chmod`/`chown`/`stat` still work, and truncate-to-zero on a `Writable` file clears the flag; logged for operator visibility instead of being retried forever. |
 | Power loss / crash mid-write | On next mount, WAL replay | Data disks: incomplete trailing record in a segment is detected via checksum/length sanity and truncated (standard log-structured recovery). Metadata: WAL is replayed from last checkpoint on both metadata disks (they agree, since writes were synchronous); any op whose data-write never got acked is simply absent from the WAL and never happened. |
 | Bit rot | Scrubber / read-time checksum mismatch | Repair from healthy replica (§8.1). |
 | Conversion interrupted (crash mid-`Converting`) | Inode `mode == Converting` found on restart | Discard partial extent map, resume from step 2 of §9.3 (old chunk-log is still intact and authoritative until the atomic swap in step 5, so this is always safe to restart from scratch). |
