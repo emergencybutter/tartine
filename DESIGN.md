@@ -356,6 +356,52 @@ migration* path above applies unchanged: add it as the backup, let it
 catch up via full copy + WAL replay, then bump the epoch — there is no
 separate "graduate out of single-disk mode" mechanism to build.
 
+**Hard reboot with only one metadata disk surviving** (the specific
+case the "On mount" discovery step above exists to handle correctly,
+spelled out): after an unclean shutdown, it's entirely possible for the
+remount to find only one of the group's N metadata disks present — the
+other might be genuinely dead, still spinning up, or just slower to
+enumerate on this boot. This is safe, for two independent reasons that
+both have to hold:
+
+1. **The surviving WAL is never internally wrong, only possibly short by
+   one op.** Step 3's rule — an op is acknowledged to the caller only
+   once it's durable on *every* disk in the group — means any op the
+   caller was told succeeded is, by construction, already present on
+   every disk that was a group member at ack time. A hard crash can only
+   ever leave the single most-recent, still-in-flight op inconsistent
+   across replicas (present on some, absent on others) — and since that
+   op was never acknowledged, no caller has any expectation it happened,
+   exactly matching the uncertainty an ordinary fsync-boundary crash
+   leaves on any single-disk log. Replaying whichever disk comes back
+   therefore always reconstructs a valid, causally-consistent state:
+   every acknowledged mutation is there, and at most one unacknowledged
+   one might quietly not be — never a corrupted or partially-applied
+   op, and never one replica silently missing something the other
+   replica's *acknowledged* history depends on.
+2. **Trusting that survivor as authoritative still goes through the "On
+   mount" quorum check above, not an assumption that "the disk that
+   happened to boot must be right."** The surviving metadata disk's
+   cached `MetaGroup`/epoch is corroborated against the bootstrap-pointer
+   echoes on every *other* present disk in the pool (data-role disks
+   included, per "On mount" above) before it's adopted — this is what
+   catches the case where the disk that rebooted successfully was
+   actually stale (e.g. it had already been fenced out and replaced
+   before the crash, and just hadn't been wiped yet, so its own on-disk
+   epoch looks perfectly self-consistent but is out of date). Only once
+   a majority of present disks corroborate its epoch does mount proceed
+   — serving immediately from that one surviving disk, in the same
+   primary-only degraded mode the live-failure path above already
+   describes, while provisioning and resyncing a replacement second disk
+   in the background. If the *other* disk later reappears carrying an
+   epoch that lost that vote, it's the stale side by definition and is
+   never silently trusted — reconciling it (if it has any tail worth
+   examining at all) requires an explicit `tartinectl pool adopt`.
+
+For a single-disk pool (previous bullet, N=1) this whole question is
+moot: there is only ever one metadata disk, so "does it come back" has a
+single boolean answer with no cross-replica reconciliation to perform.
+
 ## 7. Pool management & placement
 
 ### 7.1 Pool map
@@ -848,6 +894,7 @@ extent map changed (new allocation, size growth), not per write.
 | Data disk disappears *and* also held a metadata replica (§5.1 — common on small pools, always true for a single-disk pool) | Same detection as both single-role rows, same event | Metadata resync (row below) is serviced first; the data repair above for that disk's chunks is queued behind it, not skipped (§8.2). |
 | Metadata disk disappears | I/O error on WAL write | Fence out of `MetaGroup`, `epoch += 1`, continue degraded (primary-only) while provisioning + resyncing a replacement (§6). |
 | Both metadata disks gone simultaneously | Mount fails | Manual recovery: operator points a mount attempt at any surviving data disks; namespace is unrecoverable beyond what can be reconstructed from data-disk superblocks' cached `MetaGroup`/pool-map echoes (best-effort) — this is the one true single point of failure in v1, called out explicitly in §14. |
+| Hard reboot; only one of the metadata group's disks comes back up | Mount-time device scan (§3) finds fewer than the full group | Bootstrap-pointer echoes from every present disk corroborate the survivor's cached epoch before it's trusted (§6, "On mount" / "Hard reboot with only one metadata disk surviving"); if a majority confirms, mount serves from that disk alone (same degraded, 1-copy mode as a live backup failure) while resyncing a replacement in the background; if ambiguous, mount refuses pending `tartinectl pool adopt`. |
 | A chunk/extent's last surviving replica is lost (a `replication_factor == 1` file's only disk dies, e.g. any file on a single-disk pool; or simultaneous loss exceeds a file's configured replication factor) | Repair loop finds zero surviving replicas for the chunk/extent | Inode's `data_lost` flag is set (§8.3); `read`/`write`/`TARTINE_IOC_MAKE_WRITABLE`/nonzero-`ftruncate` return `EIO`; `unlink`/`chmod`/`chown`/`stat` still work; logged for operator visibility instead of being retried forever. |
 | Power loss / crash mid-write | On next mount, WAL replay | Data disks: incomplete trailing record in a segment is detected via checksum/length sanity and truncated (standard log-structured recovery). Metadata: WAL is replayed from last checkpoint on both metadata disks (they agree, since writes were synchronous); any op whose data-write never got acked is simply absent from the WAL and never happened. |
 | Bit rot | Scrubber / read-time checksum mismatch | Repair from healthy replica (§8.1). |
