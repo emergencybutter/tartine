@@ -266,8 +266,8 @@ containing:
 
 - **inode table**: `inode_id -> InodeRecord` (mode flags including
   `AppendOnly | Converting | Writable`, size, redundancy policy (§10),
-  owner, timestamps, xattrs, and either a chunk-log pointer list or an
-  extent map depending on state).
+  owner, timestamps, xattrs, a `data_lost` flag (§8.3), and either a
+  chunk-log pointer list or an extent map depending on state).
 - **directory tree**: `(parent_inode, name) -> inode_id`, plus a reverse
   `inode_id -> (parent_inode, name)` for `..`/hardlink accounting.
 - **pool map**: current disk membership, roles, epoch, health state.
@@ -477,6 +477,95 @@ already gone/dead):
   replica (if `replication_factor > 1`) before surfacing an error to the
   application, and kick the repair loop for that chunk immediately rather
   than waiting for the scrubber's turn.
+
+### 8.1 Repair restores replication *intent*, not just a copy count
+
+"Repair" means re-placing the missing/corrupt replica exactly where a
+fresh write would put it today, not merely "copy it somewhere so there
+are N copies again": the repair loop re-derives the target disk with the
+same HRW computation (§7.2) over the chunk's `(inode, chunk_seq)` /
+`(inode, extent_index)` key against the **current** pool map, honoring
+the file's declared `RedundancyScheme` (§10) — a slot pinned to a disk
+class or a specific disk stays pinned, an `AnyOfClass` slot gets
+re-ranked from scratch. This is the same code path §7.4's "Force" disk
+removal already describes ("re-place it per the *n-1-disk* HRW view");
+§8's scrubber-driven repair and §7.4's disk-loss repair are the same
+mechanism triggered by two different detectors (periodic scrub vs.
+health-monitor disk-removal event), not two different behaviors to keep
+in sync.
+
+### 8.2 Repair prioritization: metadata before data
+
+A disk can hold both the data and metadata roles (§5.1 — the common case
+for small pools, and *always* the case for a single-disk pool, §6). When
+one disk failure degrades both at once, **metadata resync is serviced
+first**: the health monitor's fencing + backup-reprovisioning (§6,
+"Failure") runs immediately and is not queued behind the data repair
+loop's work for that same disk. This is a deliberate priority, not an
+accident of implementation order — losing the *second* metadata disk
+before a replacement finishes resyncing loses the entire namespace (§14's
+"one true single point of failure"), while data that's merely
+under-replicated (assuming its configured replication factor was ≥2 to
+begin with) is at elevated risk of loss, not yet lost. The scrubber/
+repair loop for the failed disk's data chunks still runs — it's queued
+behind metadata resync, not skipped — and picks up as soon as the
+health monitor has spare I/O priority to give it.
+
+### 8.3 Total data loss: the `data_lost` inode flag
+
+§8's repair loop assumes at least one surviving replica to repair *from*.
+That assumption doesn't always hold:
+
+- A file with `replication_factor == 1` (always true for every file on a
+  single-disk pool, §6; possible on a larger pool via an explicit
+  single-slot redundancy policy, §10) loses a chunk/extent outright the
+  moment its one disk dies — there was never a second copy to fall back
+  on.
+- Even at `replication_factor > 1`, simultaneous loss of every disk
+  holding a given chunk's replicas (rare, but the whole point of a
+  failure matrix is enumerating the rare cases) has the same result.
+
+When the repair loop (or a read-time checksum failure, §8) finds a
+chunk/extent with **zero** surviving replicas — as opposed to merely
+being unable to find a *new* disk to repair onto, which is the
+pre-existing `Unplaceable`/`ENOSPC` case from §7.2 — that data is gone,
+not degraded-with-repair-pending. In the same metadata transaction that
+records the empty replica list, the inode's `data_lost` flag is set
+(`InodeRecord.data_lost`, §5.4) — a permanent, on-disk fact about the
+file, not a transient in-memory error, so it survives remount and is
+visible to `TARTINE_IOC_GET_STATE` (§9.2) for monitoring tooling.
+
+Setting `data_lost` puts the file into **read-only-metadata quarantine**:
+
+- **Still permitted** — anything that only touches the inode's metadata,
+  not its data: `stat`/`getattr` (so the file still shows up in `ls`,
+  with its last-known size), `unlink` (`rm` always works — a file with no
+  recoverable content shouldn't also be impossible to remove), and
+  `chmod`/`chown`/xattr changes (ownership and permissions are metadata,
+  same reasoning as §9.2's "conversion is restricted like `chmod`" — the
+  operation itself doesn't touch a data disk, so there's no reason to
+  block it).
+- **Rejected with `EIO`** — anything that requires reading or writing
+  file content: `read`, `write`/`pwrite` (append or random), the
+  `TARTINE_IOC_MAKE_WRITABLE` conversion ioctl (§9.3 step 3 needs to
+  stream-read the very chunk-log records that are gone), and `ftruncate`
+  to a nonzero size (would need to preserve surviving bytes across the
+  resize). `EIO` rather than a bespoke errno: this is exactly what a
+  conventional filesystem reports for an unreadable sector, and `tartine`
+  doesn't need a special vocabulary for "your data is unrecoverable" that
+  application code wouldn't already know how to handle.
+
+**Granularity is whole-file, not per-chunk/per-extent**, even though a
+file with `replication_factor > 1` could in principle lose only some of
+its chunks while others remain perfectly readable. This is a deliberate
+v1 simplification, in the same spirit as §11's fixed extent size: POSIX
+`read()` has no good way to say "bytes 0–4095 are fine, 4096–8191 are
+gone, keep going" without every caller having to learn a new convention,
+and once *any* part of a file is definitively unrecoverable, `rm` +
+restore-from-wherever-the-real-backup-is is the practical recovery path
+regardless of how much of the rest survived. A future refinement could
+track loss per chunk/extent and only fail reads that actually touch a
+lost range — noted as an option in §14, not built here.
 
 ## 9. Append-only files and the writable conversion
 
@@ -755,11 +844,13 @@ extent map changed (new allocation, size growth), not per write.
 
 | Event | Detection | Response |
 |---|---|---|
-| Data disk disappears | I/O error / device removal uevent | Mark `Dead` in pool map (metadata txn); chunks/extents it held are under-replicated → repair loop re-replicates from survivors to newly HRW-selected disks. |
+| Data disk disappears | I/O error / device removal uevent | Mark `Dead` in pool map (metadata txn); chunks/extents it held are under-replicated → repair loop re-replicates from survivors to newly HRW-selected disks (§8.1). |
+| Data disk disappears *and* also held a metadata replica (§5.1 — common on small pools, always true for a single-disk pool) | Same detection as both single-role rows, same event | Metadata resync (row below) is serviced first; the data repair above for that disk's chunks is queued behind it, not skipped (§8.2). |
 | Metadata disk disappears | I/O error on WAL write | Fence out of `MetaGroup`, `epoch += 1`, continue degraded (primary-only) while provisioning + resyncing a replacement (§6). |
 | Both metadata disks gone simultaneously | Mount fails | Manual recovery: operator points a mount attempt at any surviving data disks; namespace is unrecoverable beyond what can be reconstructed from data-disk superblocks' cached `MetaGroup`/pool-map echoes (best-effort) — this is the one true single point of failure in v1, called out explicitly in §14. |
+| A chunk/extent's last surviving replica is lost (a `replication_factor == 1` file's only disk dies, e.g. any file on a single-disk pool; or simultaneous loss exceeds a file's configured replication factor) | Repair loop finds zero surviving replicas for the chunk/extent | Inode's `data_lost` flag is set (§8.3); `read`/`write`/`TARTINE_IOC_MAKE_WRITABLE`/nonzero-`ftruncate` return `EIO`; `unlink`/`chmod`/`chown`/`stat` still work; logged for operator visibility instead of being retried forever. |
 | Power loss / crash mid-write | On next mount, WAL replay | Data disks: incomplete trailing record in a segment is detected via checksum/length sanity and truncated (standard log-structured recovery). Metadata: WAL is replayed from last checkpoint on both metadata disks (they agree, since writes were synchronous); any op whose data-write never got acked is simply absent from the WAL and never happened. |
-| Bit rot | Scrubber / read-time checksum mismatch | Repair from healthy replica (§8). |
+| Bit rot | Scrubber / read-time checksum mismatch | Repair from healthy replica (§8.1). |
 | Conversion interrupted (crash mid-`Converting`) | Inode `mode == Converting` found on restart | Discard partial extent map, resume from step 2 of §9.3 (old chunk-log is still intact and authoritative until the atomic swap in step 5, so this is always safe to restart from scratch). |
 
 ## 13. Explicit non-goal: multi-host HA
@@ -808,6 +899,11 @@ and what's future work is explicit.
   I/O, the on-disk metadata B-tree, the rebalancer/scrubber) and why it
   wasn't attempted further without a real kernel build tree to verify
   against.
+- `data_lost` (§8.3) is a whole-file flag, not per-chunk/per-extent, so a
+  file that lost only one chunk out of many is quarantined exactly the
+  same as one that lost everything. Tracking loss at chunk/extent
+  granularity and only failing reads that actually touch a lost range is
+  a plausible future refinement, not built here.
 
 ## 15. Suggested milestones
 

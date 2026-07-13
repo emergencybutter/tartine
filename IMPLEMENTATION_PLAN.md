@@ -245,12 +245,25 @@ gets provisioned.
 
 **Tasks**: background checksum verification (DESIGN.md §8), repair from
 a healthy replica on mismatch or on detected under-replication (feeds
-off P1.7's "which chunks are below target replica count" bookkeeping).
+off P1.7's "which chunks are below target replica count" bookkeeping),
+re-deriving the target disk via HRW against the *current* pool map so
+repair restores the file's declared redundancy scheme rather than just
+"a" copy (§8.1). When a disk held both roles (§5.1), metadata resync
+(P1.7) must be serviced before this milestone's data repair runs for
+that disk's chunks (§8.2) — not a separate mechanism, just a priority
+the scheduler needs to respect. And when repair finds a chunk/extent
+with zero surviving replicas (not just "nowhere to repair to" —
+`Unplaceable`, already handled), set `InodeRecord.data_lost` and make
+`read`/`write`/`convert` return `EIO` while `unlink`/`chmod`/`chown`
+keep working (§8.3).
 
 **Exit criteria**: corrupt a byte in one replica's on-disk record
 directly (bypassing the filesystem), confirm the scrubber detects and
 repairs it within one scrub cycle; kill a disk, confirm affected files'
-replicas get rebuilt onto a different disk.
+replicas get rebuilt onto a different disk; kill the only disk holding a
+`replication_factor == 1` file's data (or all replicas of some chunk),
+confirm the inode is marked `data_lost` and `read`/`write`/`convert` on
+it return `EIO` while `rm`/`chmod` on it still succeed.
 
 ### P1.9 — The materializer (append→writable, for real)
 
